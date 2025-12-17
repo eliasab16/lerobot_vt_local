@@ -11,24 +11,19 @@ robot:
       width: 800
       height: 600
       fps: 30
-    overview_top:
+    overhead_top:
       type: opencv
       index_or_path: 1
       width: 800
       height: 600
       fps: 30
-    overview_bottom:
+    wrist_bottom:
       type: opencv
       index_or_path: 2
       width: 800
       height: 600
       fps: 30
-    wrist_bottom:
-      type: opencv
-      index_or_path: 3
-      width: 800
-      height: 600
-      fps: 30
+    
 
 teleop:
   type: so101_leader
@@ -44,4 +39,4 @@ dataset:
   episode_time_s: 60
   repo_id: eliasab16/xvlm_insert_tip_into_mounted_device
 
-resume: true
+resume: false
