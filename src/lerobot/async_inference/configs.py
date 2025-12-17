@@ -142,6 +142,9 @@ class RobotClientConfig:
         default=False, metadata={"help": "Visualize the action queue size"}
     )
 
+    # Rename cameras
+    rename_map: dict[str, str] = field(default_factory=dict)
+
     @property
     def environment_dt(self) -> float:
         """Environment time step, in seconds"""
@@ -190,4 +193,5 @@ class RobotClientConfig:
             "task": self.task,
             "debug_visualize_queue_size": self.debug_visualize_queue_size,
             "aggregate_fn_name": self.aggregate_fn_name,
+            "rename_map": self.rename_map
         }
