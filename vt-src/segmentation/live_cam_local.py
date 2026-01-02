@@ -1,3 +1,9 @@
+# To run this script with mps acceleration:
+#   cd inference
+#   uvicorn cpu_http:app --port 9001 --host 0.0.0.0
+#
+# Make sure that the server is running on localhost:9001
+
 import cv2
 import os
 import time
