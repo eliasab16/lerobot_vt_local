@@ -127,6 +127,7 @@ from lerobot.utils.utils import (
     log_say,
 )
 from lerobot.utils.visualization_utils import init_rerun, log_rerun_data
+from lerobot.cameras.segmentation_client import SegmentationClient
 
 
 @dataclass
@@ -174,6 +175,18 @@ class DatasetRecordConfig:
 
 
 @dataclass
+class SegmentationConfig:
+    # Whether to apply segmentation masks to camera frames
+    enabled: bool = False
+    # URL of the inference server
+    api_url: str = "http://localhost:9001"
+    # Roboflow model id for segmentation
+    model_id: str = "switches-wymit/2"
+    # Confidence threshold for predictions
+    confidence_threshold: float = 0.8
+
+
+@dataclass
 class RecordConfig:
     robot: RobotConfig
     dataset: DatasetRecordConfig
@@ -181,6 +194,8 @@ class RecordConfig:
     teleop: TeleoperatorConfig | None = None
     # Whether to control the robot with a policy
     policy: PreTrainedConfig | None = None
+    # Segmentation configuration for applying masks to camera frames
+    segmentation: SegmentationConfig | None = None
     # Display all cameras on screen
     display_data: bool = False
     # Use vocal synthesis to read events.
@@ -377,6 +392,13 @@ def record(cfg: RecordConfig) -> LeRobotDataset:
     if cfg.display_data:
         init_rerun(session_name="recording")
 
+    # override camera-level segmentation if global segmentation is disabled (turn off segmentation for all cameras)
+    if not (cfg.segmentation and cfg.segmentation.enabled):
+        if hasattr(cfg.robot, 'cameras') and cfg.robot.cameras:
+            for cam_config in cfg.robot.cameras.values():
+                if hasattr(cam_config, 'enable_segmentation'):
+                    cam_config.enable_segmentation = False
+
     robot = make_robot_from_config(cfg.robot)
     teleop = make_teleoperator_from_config(cfg.teleop) if cfg.teleop is not None else None
 
@@ -439,6 +461,22 @@ def record(cfg: RecordConfig) -> LeRobotDataset:
                 "rename_observations_processor": {"rename_map": cfg.dataset.rename_map},
             },
         )
+
+    # Segmentation logic
+    if cfg.segmentation and cfg.segmentation.enabled:
+        client = SegmentationClient.get_instance(
+            api_url=cfg.segmentation.api_url,
+            model_id=cfg.segmentation.model_id,
+            confidence_threshold=cfg.segmentation.confidence_threshold
+        )
+        
+        if not client.check_server_health():
+            raise RuntimeError(
+                f"Segmentation server at {cfg.segmentation.api_url} is not running. "
+                "Please start the server with: cd inference && uvicorn cpu_http:app --port 9001 --host 0.0.0.0"
+            )
+        
+        logging.info(f"Segmentation enabled with model {cfg.segmentation.model_id}")
 
     robot.connect()
     if teleop is not None:
