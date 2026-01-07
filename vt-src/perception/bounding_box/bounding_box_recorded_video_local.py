@@ -3,8 +3,6 @@
 #   cd inference
 #   uvicorn cpu_http:app --port 9001 --host 0.0.0.0
 #
-# Make sure that the server is running on localhost:9001
-#
 # Usage:
 #   python bounding_box_recorded_video_local.py --input path/to/input.mp4 --output path/to/output.mp4
 
@@ -18,7 +16,7 @@ from inference_sdk import InferenceHTTPClient, InferenceConfiguration
 
 load_dotenv()
 ROBOFLOW_API_KEY = os.getenv("ROBOFLOW_API_KEY")
-MODEL_ID = "wires-uoqnx/1"
+MODEL_ID = "wires-one-class/3"
 
 parser = argparse.ArgumentParser(description='Process recorded video with bounding box detection')
 parser.add_argument('--input', '-i', required=True, help='Input video file path')
@@ -36,7 +34,7 @@ client = InferenceHTTPClient(
 )
 
 config = InferenceConfiguration(
-    confidence_threshold=0.8,
+    confidence_threshold=0.6,
     iou_threshold=0.5
 )
 client.configure(config)
@@ -70,22 +68,19 @@ def process_video_file(input_video_path, output_video_path):
         display_frame = frame.copy()
         if result and 'predictions' in result:
             for pred in result['predictions']:
-                # Get bounding box coordinates
                 x = int(pred.get('x', 0))
                 y = int(pred.get('y', 0))
                 w = int(pred.get('width', 0))
                 h = int(pred.get('height', 0))
                 
-                # Calculate corner points (x, y is center point)
+                # (x,y) is the center point, we need to calculate the corners
                 x1 = x - w // 2
                 y1 = y - h // 2
                 x2 = x + w // 2
                 y2 = y + h // 2
                 
-                # Draw bounding box rectangle
                 cv2.rectangle(display_frame, (x1, y1), (x2, y2), (0, 255, 0), 2)
                 
-                # Add label with class name and confidence
                 class_name = pred.get('class', 'unknown')
                 confidence = pred.get('confidence', 0)
                 label = f"{class_name}: {confidence:.2f}"
