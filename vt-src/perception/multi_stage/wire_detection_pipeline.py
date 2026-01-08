@@ -265,6 +265,7 @@ if __name__ == "__main__":
         if output_dir:
             os.makedirs(output_dir, exist_ok=True)
     
+    print("=" * 60)
     print(f"\nProcessing: {input_video_path}")
     if save_video:
         print(f"Output: {output_video_path}")
@@ -273,7 +274,7 @@ if __name__ == "__main__":
     print(f"Target color(s): {', '.join(target_colors)}")
     print(f"Bbox threshold: {bbox_threshold}")
     print(f"Color threshold: {color_threshold}")
-    print()
+    print("=" * 60)
     
     start_time = time.time()
     frame_count, total_boxes, matched_boxes = process_video_file(
@@ -288,13 +289,4 @@ if __name__ == "__main__":
     minutes = int(processing_time // 60)
     seconds = processing_time % 60
     
-    print(f"\n{'='*60}")
-    print(f"Processing complete!")
-    print(f"Frames processed: {frame_count}")
-    print(f"Total boxes detected: {total_boxes}")
-    print(f"Boxes matching {target_colors}: {matched_boxes}")
-    print(f"Match rate: {100*matched_boxes/total_boxes:.1f}%" if total_boxes > 0 else "N/A")
-    print(f"Time: {minutes}m {seconds:.1f}s")
-    if save_video:
-        print(f"Output: {output_video_path}")
-    print(f"{'='*60}")
+    print(f"Processing completed in {minutes}m {seconds:.1f}s")
