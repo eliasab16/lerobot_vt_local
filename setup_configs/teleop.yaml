@@ -29,4 +29,11 @@ teleop:
   port: /dev/tty.usbmodem5A680110941
   id: right_leader
 
+frame_processor:
+  type: wire_detection
+  config:
+    target_colors: ["red"]
+    bbox_model_type: "yolo"
+    frame_stride: 3
+    cameras: ["OpenCVCamera(0)", "OpenCVCamera(1)", "OpenCVCamera(2)"]
 display_data: true

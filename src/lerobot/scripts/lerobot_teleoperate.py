@@ -51,9 +51,13 @@ lerobot-teleoperate \
 
 """
 
+import os
+os.environ['PYTORCH_ENABLE_MPS_FALLBACK'] = '1'
+
 import logging
 import time
-from dataclasses import asdict, dataclass
+import sys
+from dataclasses import asdict, dataclass, field
 from pprint import pformat
 
 import rerun as rr
@@ -97,6 +101,13 @@ from lerobot.utils.visualization_utils import init_rerun, log_rerun_data
 
 
 @dataclass
+class FrameProcessorConfig:
+    """Configuration for frame processor to apply inference to camera frames."""
+    type: str
+    config: dict = field(default_factory=dict)
+
+
+@dataclass
 class TeleoperateConfig:
     # TODO: pepijn, steven: if more robots require multiple teleoperators (like lekiwi) its good to make this possibele in teleop.py and record.py with List[Teleoperator]
     teleop: TeleoperatorConfig
@@ -106,6 +117,8 @@ class TeleoperateConfig:
     teleop_time_s: float | None = None
     # Display all cameras on screen
     display_data: bool = False
+    # Frame processor configuration for applying inference to camera frames
+    frame_processor: FrameProcessorConfig | None = None
 
 
 def teleop_loop(
@@ -194,6 +207,19 @@ def teleoperate(cfg: TeleoperateConfig):
     teleop = make_teleoperator_from_config(cfg.teleop)
     robot = make_robot_from_config(cfg.robot)
     teleop_action_processor, robot_action_processor, robot_observation_processor = make_default_processors()
+
+    # Initialize frame processor if configured
+    if cfg.frame_processor is not None:
+        try:
+            sys.path.insert(0, '/Users/elisd/Desktop/vult/vt-src')
+            from vt_perception.frame_processor import FrameProcessorRegistry
+            FrameProcessorRegistry.initialize(
+                cfg.frame_processor.type,
+                cfg.frame_processor.config
+            )
+            logging.info(f"Frame processor '{cfg.frame_processor.type}' initialized")
+        except Exception as e:
+            raise RuntimeError(f"Failed to initialize frame processor: {e}") from e
 
     teleop.connect()
     robot.connect()
