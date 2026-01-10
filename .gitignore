@@ -54,6 +54,7 @@ lib64/
 
 ### Compiled & Cached Files ###
 __pycache__/
+*.pyc
 *.py[cod]
 *$py.class
 *.so
