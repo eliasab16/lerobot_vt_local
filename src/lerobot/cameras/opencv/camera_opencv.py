@@ -37,7 +37,13 @@ from lerobot.utils.errors import DeviceAlreadyConnectedError, DeviceNotConnected
 from ..camera import Camera
 from ..utils import get_cv2_backend, get_cv2_rotation
 from .configuration_opencv import ColorMode, OpenCVCameraConfig
-from lerobot.cameras.segmentation_client import SegmentationClient
+
+# Frame processor import
+import sys
+_vt_src_path = '/Users/elisd/Desktop/vult/vt-src'
+if _vt_src_path not in sys.path:
+    sys.path.insert(0, _vt_src_path)
+from vt_perception.frame_processor import FrameProcessorRegistry
 
 # NOTE(Steven): The maximum opencv device index depends on your operating system. For instance,
 # if you have 3 cameras, they should be associated to index 0, 1, and 2. This is the case
@@ -517,14 +523,9 @@ class OpenCVCamera(Camera):
         if frame is None:
             raise RuntimeError(f"Internal error: Event set but no frame available for {self}.")
 
-        # Apply segmentation mask if enabled
-        if self.config.enable_segmentation:
-            client = SegmentationClient.get_instance()
-            if client is None:
-                raise RuntimeError(
-                    "Segmentation is enabled for this camera but SegmentationClient is not initialized."
-                )
-            frame = client.apply_mask(frame)
+        # Apply frame processor (returns frame unchanged if no processor active)
+        # Pass camera identifier for per-camera state management
+        frame = FrameProcessorRegistry.process(frame, camera_id=str(self))
 
         return frame
 
