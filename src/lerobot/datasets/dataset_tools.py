@@ -54,6 +54,26 @@ from lerobot.datasets.utils import (
 from lerobot.utils.constants import HF_LEROBOT_HOME
 
 
+def _convert_extension_dtypes_to_numpy(df: pd.DataFrame) -> pd.DataFrame:
+    """Convert PyArrow extension dtypes to numpy arrays to avoid dtype comparison issues.
+
+    When datasets library is imported, pd.read_parquet() creates PandasArrayExtensionDtype
+    for array columns. These need to be converted to standard Python/numpy objects before
+    pandas operations like .replace(), .isin(), etc. to avoid AttributeError:
+    'PandasArrayExtensionDtype' object has no attribute 'v'.
+
+    The most reliable way to handle this is to convert through dict and back.
+
+    Args:
+        df: DataFrame potentially containing PyArrow extension dtypes
+
+    Returns:
+        DataFrame with extension dtypes converted to numpy arrays
+    """
+    # Convert to dict and back - this materializes all extension types into native Python/numpy objects
+    return pd.DataFrame(df.to_dict(orient="list"))
+
+
 def _load_episode_with_stats(src_dataset: LeRobotDataset, episode_idx: int) -> dict:
     """Load a single episode's metadata including stats from parquet file.
 
@@ -70,6 +90,7 @@ def _load_episode_with_stats(src_dataset: LeRobotDataset, episode_idx: int) -> d
 
     parquet_path = src_dataset.root / DEFAULT_EPISODES_PATH.format(chunk_index=chunk_idx, file_index=file_idx)
     df = pd.read_parquet(parquet_path)
+    df = _convert_extension_dtypes_to_numpy(df)
 
     episode_row = df[df["episode_index"] == episode_idx].iloc[0]
 
@@ -498,6 +519,7 @@ def _copy_and_reindex_data(
         all_task_indices = set()
         for src_path in file_to_episodes:
             df = pd.read_parquet(src_dataset.root / src_path)
+            df = _convert_extension_dtypes_to_numpy(df)
             mask = df["episode_index"].isin(list(episode_mapping.keys()))
             task_series: pd.Series = df[mask]["task_index"]
             all_task_indices.update(task_series.unique().tolist())
@@ -513,6 +535,7 @@ def _copy_and_reindex_data(
 
     for src_path in tqdm(sorted(file_to_episodes.keys()), desc="Processing data files"):
         df = pd.read_parquet(src_dataset.root / src_path)
+        df = _convert_extension_dtypes_to_numpy(df)
 
         all_episodes_in_file = set(df["episode_index"].unique())
         episodes_to_keep = file_to_episodes[src_path]
@@ -973,6 +996,7 @@ def _copy_data_with_feature_changes(
 
     for src_path in tqdm(parquet_files, desc="Processing data files"):
         df = pd.read_parquet(src_path).reset_index(drop=True)
+        df = _convert_extension_dtypes_to_numpy(df)
 
         relative_path = src_path.relative_to(dataset.root)
         chunk_dir = relative_path.parts[1]

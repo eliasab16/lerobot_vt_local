@@ -42,6 +42,23 @@ from lerobot.datasets.utils import (
 from lerobot.datasets.video_utils import concatenate_video_files, get_video_duration_in_s
 
 
+def _convert_extension_dtypes_to_numpy(df: pd.DataFrame) -> pd.DataFrame:
+    """Convert PyArrow extension dtypes to numpy arrays to avoid dtype comparison issues."""
+    return pd.DataFrame(df.to_dict(orient="list"))
+
+
+def read_parquet_safe(path) -> pd.DataFrame:
+    """Read parquet file using pyarrow directly, bypassing pandas extension type issues.
+    
+    pd.read_parquet() crashes when datasets library is imported because it creates
+    PandasArrayExtensionDtype that pandas can't handle. Using pyarrow directly and
+    converting via to_pydict() bypasses this issue entirely.
+    """
+    import pyarrow.parquet as pq
+    table = pq.read_table(path)
+    return pd.DataFrame(table.to_pydict())
+
+
 def validate_all_metadata(all_metadata: list[LeRobotDatasetMetadata]):
     """Validates that all dataset metadata have consistent properties.
 
@@ -407,7 +424,8 @@ def aggregate_data(src_meta, dst_meta, data_idx, data_files_size_in_mb, chunk_si
         src_path = src_meta.root / DEFAULT_DATA_PATH.format(
             chunk_index=src_chunk_idx, file_index=src_file_idx
         )
-        df = pd.read_parquet(src_path)
+        df = read_parquet_safe(src_path)
+        df = _convert_extension_dtypes_to_numpy(df)
         df = update_data_df(df, src_meta, dst_meta)
 
         data_idx = append_or_create_parquet_file(
@@ -452,7 +470,8 @@ def aggregate_metadata(src_meta, dst_meta, meta_idx, data_idx, videos_idx):
     chunk_file_ids = sorted(chunk_file_ids)
     for chunk_idx, file_idx in chunk_file_ids:
         src_path = src_meta.root / DEFAULT_EPISODES_PATH.format(chunk_index=chunk_idx, file_index=file_idx)
-        df = pd.read_parquet(src_path)
+        df = read_parquet_safe(src_path)
+        df = _convert_extension_dtypes_to_numpy(df)
         df = update_meta_data(
             df,
             dst_meta,
@@ -527,7 +546,8 @@ def append_or_create_parquet_file(
         final_df = df
         target_path = new_path
     else:
-        existing_df = pd.read_parquet(dst_path)
+        existing_df = read_parquet_safe(dst_path)
+        existing_df = _convert_extension_dtypes_to_numpy(existing_df)
         final_df = pd.concat([existing_df, df], ignore_index=True)
         target_path = dst_path
 
