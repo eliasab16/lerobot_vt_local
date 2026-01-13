@@ -26,7 +26,7 @@ robot:
 
 teleop:
   type: so101_leader
-  port: /dev/tty.usbmodem5A680110941
+  port: /dev/tty.usbmodem5A680135321
   id: right_leader
 
 frame_processor:
@@ -34,6 +34,6 @@ frame_processor:
   config:
     target_colors: ["red"]
     bbox_model_type: "yolo"
-    frame_stride: 3
+    frame_stride: 2
     cameras: ["OpenCVCamera(0)", "OpenCVCamera(1)", "OpenCVCamera(2)"]
 display_data: true
