@@ -98,6 +98,9 @@ class XVLAConfig(PreTrainedConfig):
     freeze_language_encoder: bool = False  # Freeze VLM language encoder weights
     train_policy_transformer: bool = True  # Allow policy transformer to train
     train_soft_prompts: bool = True  # Allow soft prompts to train
+    
+    # PEFT (Parameter-Efficient Fine-Tuning) - not yet implemented, placeholder for compatibility
+    use_peft: bool = False
 
     # Training presets
     optimizer_lr: float = 1e-4
