@@ -169,6 +169,8 @@ class DatasetRecordConfig:
     video_encoding_batch_size: int = 1
     # Rename map for the observation to override the image and state keys
     rename_map: dict[str, str] = field(default_factory=dict)
+    # Repository ID for saving intervention-only recordings when toggling from policy to teleop mode
+    intervention_repo_id: str | None = None
 
     def __post_init__(self):
         if self.single_task is None:
@@ -270,9 +272,31 @@ def record_loop(
     control_time_s: int | None = None,
     single_task: str | None = None,
     display_data: bool = False,
+    intervention_dataset: LeRobotDataset | None = None,
+    is_reset_phase: bool = False,
 ):
     if dataset is not None and dataset.fps != fps:
         raise ValueError(f"The dataset fps should be equal to requested fps ({dataset.fps} != {fps}).")
+
+    # Initialize intervention state tracking (function attributes persist across calls)
+    if not hasattr(record_loop, "in_intervention_mode"):
+        record_loop.in_intervention_mode = False
+        record_loop.intervention_episode_started = False
+
+    # Each run starts in policy mode (reset intervention state unless in reset phase)
+    if not is_reset_phase and intervention_dataset is not None:
+        record_loop.in_intervention_mode = False
+        record_loop.intervention_episode_started = False
+
+        # Re-enable torque on leader for policy mirroring at the start of each run
+        if policy is not None and isinstance(teleop, Teleoperator) and hasattr(teleop, "bus"):
+            try:
+                teleop.bus.enable_torque(num_retry=5)
+            except Exception as e:
+                logging.warning(f"Failed to enable leader torque for mirroring: {e}")
+
+    # Determine if we're in intervention-only mode (main dataset is just a scratch buffer)
+    intervention_only_mode = intervention_dataset is not None
 
     teleop_arm = teleop_keyboard = None
     if isinstance(teleop, list):
@@ -305,9 +329,73 @@ def record_loop(
     while timestamp < control_time_s:
         start_loop_t = time.perf_counter()
 
+        # Left arrow during intervention = clear buffer, restart recording (stay in intervention)
+        if events["rerecord_episode"] and record_loop.in_intervention_mode and intervention_dataset is not None:
+            events["rerecord_episode"] = False
+            events["exit_early"] = False  # Consume the paired exit_early event
+            logging.info("Restarting intervention recording from current position")
+            intervention_dataset.clear_episode_buffer()
+            # Stay in intervention mode — new frames will accumulate from here
+            continue
+
         if events["exit_early"]:
             events["exit_early"] = False
+            # If exiting during intervention mode, reset state but keep buffer intact
+            # (outer loop decides whether to save or discard)
+            # NOTE: torque stays disabled - it will be re-enabled at the start of the next run
+            if record_loop.in_intervention_mode and intervention_dataset is not None:
+                record_loop.in_intervention_mode = False
             break
+
+        # Ignore SPACE during reset phase (consume the event to prevent carryover)
+        if events["toggle_intervention"] and (is_reset_phase or intervention_dataset is None):
+            events["toggle_intervention"] = False
+
+        # Handle intervention toggle (only during main recording, not reset)
+        if events["toggle_intervention"] and not is_reset_phase and intervention_dataset is not None:
+            events["toggle_intervention"] = False
+
+            if not record_loop.in_intervention_mode:
+                # Switching TO intervention mode
+                record_loop.in_intervention_mode = True
+                logging.info("Entering intervention mode - manual control enabled")
+
+                # DISABLE torque on leader for free manual movement
+                if isinstance(teleop, Teleoperator) and hasattr(teleop, "bus"):
+                    try:
+                        teleop.bus.disable_torque(num_retry=5)
+                        logging.info("Leader torque disabled for manual intervention")
+                    except ConnectionError as e:
+                        logging.warning(f"Failed to disable torque during intervention toggle: {e}")
+                        record_loop.in_intervention_mode = False
+                        continue
+
+                # Start buffering intervention frames
+                record_loop.intervention_episode_started = True
+            else:
+                # SPACE while in intervention = DISCARD intervention, return to policy
+                logging.info("Discarding intervention - returning to policy control")
+
+                # Clear the intervention buffer (discard recorded frames)
+                if record_loop.intervention_episode_started:
+                    intervention_dataset.clear_episode_buffer()
+                    record_loop.intervention_episode_started = False
+
+                record_loop.in_intervention_mode = False
+
+                # Re-ENABLE torque on leader for policy mirroring
+                if policy is not None and isinstance(teleop, Teleoperator) and hasattr(teleop, "bus"):
+                    try:
+                        teleop.bus.enable_torque(num_retry=5)
+                        logging.info("Leader torque re-enabled for policy mirroring")
+                    except ConnectionError as e:
+                        logging.warning(f"Failed to re-enable torque after intervention: {e}")
+
+                # Reset policy state to prevent stale predictions
+                if policy is not None and preprocessor is not None and postprocessor is not None:
+                    policy.reset()
+                    preprocessor.reset()
+                    postprocessor.reset()
 
         # Get robot observation
         obs = robot.get_observation()
@@ -315,11 +403,40 @@ def record_loop(
         # Applies a pipeline to the raw robot observation, default is IdentityProcessor
         obs_processed = robot_observation_processor(obs)
 
-        if policy is not None or dataset is not None:
-            observation_frame = build_dataset_frame(dataset.features, obs_processed, prefix=OBS_STR)
+        # Build observation frame for policy or dataset recording
+        # Determine which dataset to use for features
+        if record_loop.in_intervention_mode and intervention_dataset is not None:
+            features_dataset = intervention_dataset
+        elif dataset is not None:
+            features_dataset = dataset
+        else:
+            features_dataset = None
 
-        # Get action from either policy or teleop
-        if policy is not None and preprocessor is not None and postprocessor is not None:
+        if features_dataset is not None:
+            observation_frame = build_dataset_frame(features_dataset.features, obs_processed, prefix=OBS_STR)
+
+        # Get action from either intervention teleop, policy, or normal teleop
+        if record_loop.in_intervention_mode and intervention_dataset is not None:
+            # INTERVENTION MODE: Use teleop for manual control
+            if isinstance(teleop, Teleoperator):
+                act = teleop.get_action()
+                act_processed_teleop = teleop_action_processor((act, obs))
+            elif isinstance(teleop, list):
+                arm_action = teleop_arm.get_action()
+                arm_action = {f"arm_{k}": v for k, v in arm_action.items()}
+                keyboard_action = teleop_keyboard.get_action()
+                base_action = robot._from_keyboard_to_base_action(keyboard_action)
+                act = {**arm_action, **base_action} if len(base_action) > 0 else arm_action
+                act_processed_teleop = teleop_action_processor((act, obs))
+            else:
+                logging.warning("Intervention mode active but no teleoperator available")
+                continue
+
+            action_values = act_processed_teleop
+            robot_action_to_send = robot_action_processor((act_processed_teleop, obs))
+
+        elif policy is not None and preprocessor is not None and postprocessor is not None:
+            # POLICY MODE: Use policy for autonomous control
             action_values = predict_action(
                 observation=observation_frame,
                 policy=policy,
@@ -332,20 +449,27 @@ def record_loop(
             )
 
             act_processed_policy: RobotAction = make_robot_action(action_values, dataset.features)
+            action_values = act_processed_policy
+            robot_action_to_send = robot_action_processor((act_processed_policy, obs))
 
-        elif policy is None and isinstance(teleop, Teleoperator):
+        elif isinstance(teleop, Teleoperator):
+            # TELEOP MODE: Use teleop for normal recording
             act = teleop.get_action()
-
-            # Applies a pipeline to the raw teleop action, default is IdentityProcessor
             act_processed_teleop = teleop_action_processor((act, obs))
+            action_values = act_processed_teleop
+            robot_action_to_send = robot_action_processor((act_processed_teleop, obs))
 
-        elif policy is None and isinstance(teleop, list):
+        elif isinstance(teleop, list):
+            # MULTI-TELEOP MODE: Handle arm + keyboard teleop
             arm_action = teleop_arm.get_action()
             arm_action = {f"arm_{k}": v for k, v in arm_action.items()}
             keyboard_action = teleop_keyboard.get_action()
             base_action = robot._from_keyboard_to_base_action(keyboard_action)
             act = {**arm_action, **base_action} if len(base_action) > 0 else arm_action
             act_processed_teleop = teleop_action_processor((act, obs))
+            action_values = act_processed_teleop
+            robot_action_to_send = robot_action_processor((act_processed_teleop, obs))
+
         else:
             logging.info(
                 "No policy or teleoperator provided, skipping action generation."
@@ -354,22 +478,41 @@ def record_loop(
             )
             continue
 
-        # Applies a pipeline to the action, default is IdentityProcessor
-        if policy is not None and act_processed_policy is not None:
-            action_values = act_processed_policy
-            robot_action_to_send = robot_action_processor((act_processed_policy, obs))
-        else:
-            action_values = act_processed_teleop
-            robot_action_to_send = robot_action_processor((act_processed_teleop, obs))
-
         # Send action to robot
         # Action can eventually be clipped using `max_relative_target`,
         # so action actually sent is saved in the dataset. action = postprocessor.process(action)
         # TODO(steven, pepijn, adil): we should use a pipeline step to clip the action, so the sent action is the action that we input to the robot.
         _sent_action = robot.send_action(robot_action_to_send)
 
+        # Mirror follower movements on leader (when NOT in intervention mode)
+        # This keeps leader and follower synchronized so intervention can be seamless
+        if (
+            not record_loop.in_intervention_mode
+            and policy is not None
+            and isinstance(teleop, Teleoperator)
+            and hasattr(teleop, "bus")
+        ):
+            # Send the same action to the leader so it mirrors the follower
+            try:
+                # Extract position values from action dict (format: "motor_name.pos")
+                goal_pos = {
+                    key.removesuffix(".pos"): val
+                    for key, val in robot_action_to_send.items()
+                    if key.endswith(".pos")
+                }
+                # Send positions to leader to mirror follower
+                teleop.bus.sync_write("Goal_Position", goal_pos)
+            except Exception as e:
+                logging.debug(f"Could not mirror action on leader: {e}")
+
         # Write to dataset
-        if dataset is not None:
+        if record_loop.in_intervention_mode and intervention_dataset is not None:
+            # Record to intervention dataset
+            action_frame = build_dataset_frame(intervention_dataset.features, action_values, prefix=ACTION)
+            frame = {**observation_frame, **action_frame, "task": single_task}
+            intervention_dataset.add_frame(frame)
+        elif not intervention_only_mode and dataset is not None:
+            # Record to main dataset (only in normal mode, not intervention-only mode)
             action_frame = build_dataset_frame(dataset.features, action_values, prefix=ACTION)
             frame = {**observation_frame, **action_frame, "task": single_task}
             dataset.add_frame(frame)
@@ -393,6 +536,13 @@ def record(cfg: RecordConfig) -> LeRobotDataset:
 
     robot = make_robot_from_config(cfg.robot)
     teleop = make_teleoperator_from_config(cfg.teleop) if cfg.teleop is not None else None
+
+    # Validate that teleop is available if intervention dataset is specified
+    if cfg.dataset.intervention_repo_id is not None and cfg.teleop is None:
+        raise ValueError(
+            "Intervention dataset specified but no teleoperator configured. "
+            "You must provide a teleoperator to enable intervention recording."
+        )
 
     teleop_action_processor, robot_action_processor, robot_observation_processor = make_default_processors()
 
@@ -439,18 +589,68 @@ def record(cfg: RecordConfig) -> LeRobotDataset:
             batch_encoding_size=cfg.dataset.video_encoding_batch_size,
         )
 
+    # Create intervention dataset if specified
+    intervention_dataset = None
+    if cfg.dataset.intervention_repo_id is not None:
+        if cfg.resume:
+            # Resume existing intervention dataset
+            try:
+                intervention_dataset = LeRobotDataset(
+                    cfg.dataset.intervention_repo_id,
+                    root=cfg.dataset.root,
+                    batch_encoding_size=cfg.dataset.video_encoding_batch_size,
+                )
+                if hasattr(robot, "cameras") and len(robot.cameras) > 0:
+                    intervention_dataset.start_image_writer(
+                        num_processes=cfg.dataset.num_image_writer_processes,
+                        num_threads=cfg.dataset.num_image_writer_threads_per_camera * len(robot.cameras),
+                    )
+                logging.info(f"Resumed intervention dataset: {cfg.dataset.intervention_repo_id}")
+            except Exception as e:
+                logging.warning(f"Could not resume intervention dataset: {e}. Creating new one.")
+                intervention_dataset = None
+
+        if intervention_dataset is None:
+            # Create new intervention dataset
+            intervention_dataset = LeRobotDataset.create(
+                cfg.dataset.intervention_repo_id,
+                cfg.dataset.fps,
+                root=cfg.dataset.root,
+                robot_type=robot.name,
+                features=dataset_features,
+                use_videos=cfg.dataset.video,
+                image_writer_processes=cfg.dataset.num_image_writer_processes,
+                image_writer_threads=cfg.dataset.num_image_writer_threads_per_camera * len(robot.cameras),
+                batch_encoding_size=cfg.dataset.video_encoding_batch_size,
+            )
+            logging.info(f"Created intervention dataset: {cfg.dataset.intervention_repo_id}")
+
+    # Build rename_map from policy_camera_name fields in camera configs
+    # This maps descriptive dataset keys to policy-expected keys
+    camera_rename_map = {}
+    if hasattr(robot, "config") and hasattr(robot.config, "cameras"):
+        for cam_name, cam_config in robot.config.cameras.items():
+            if hasattr(cam_config, "policy_camera_name") and cam_config.policy_camera_name:
+                camera_rename_map[f"observation.images.{cam_name}"] = (
+                    f"observation.images.{cam_config.policy_camera_name}"
+                )
+    # Merge with any explicit rename_map from dataset config (explicit takes precedence)
+    rename_map = {**camera_rename_map, **cfg.dataset.rename_map}
+
     # Load pretrained policy
-    policy = None if cfg.policy is None else make_policy(cfg.policy, ds_meta=dataset.meta)
+    policy = None if cfg.policy is None else make_policy(
+        cfg.policy, ds_meta=dataset.meta, rename_map=rename_map or None
+    )
     preprocessor = None
     postprocessor = None
     if cfg.policy is not None:
         preprocessor, postprocessor = make_pre_post_processors(
             policy_cfg=cfg.policy,
             pretrained_path=cfg.policy.pretrained_path,
-            dataset_stats=rename_stats(dataset.meta.stats, cfg.dataset.rename_map),
+            dataset_stats=rename_stats(dataset.meta.stats, rename_map),
             preprocessor_overrides={
                 "device_processor": {"device": cfg.policy.device},
-                "rename_observations_processor": {"rename_map": cfg.dataset.rename_map},
+                "rename_observations_processor": {"rename_map": rename_map},
             },
         )
 
@@ -470,35 +670,26 @@ def record(cfg: RecordConfig) -> LeRobotDataset:
     if teleop is not None:
         teleop.connect()
 
+        # Enable torque on leader when using a policy so it can mirror the follower
+        if policy is not None and isinstance(teleop, Teleoperator) and hasattr(teleop, "bus"):
+            try:
+                teleop.bus.enable_torque(num_retry=5)
+                logging.info("Leader torque enabled for policy mirroring")
+            except Exception as e:
+                logging.warning(f"Failed to enable leader torque for mirroring: {e}")
+
     listener, events = init_keyboard_listener()
 
-    with VideoEncodingManager(dataset):
-        recorded_episodes = 0
-        while recorded_episodes < cfg.dataset.num_episodes and not events["stop_recording"]:
-            log_say(f"Recording episode {dataset.num_episodes}", cfg.play_sounds)
-            record_loop(
-                robot=robot,
-                events=events,
-                fps=cfg.dataset.fps,
-                teleop_action_processor=teleop_action_processor,
-                robot_action_processor=robot_action_processor,
-                robot_observation_processor=robot_observation_processor,
-                teleop=teleop,
-                policy=policy,
-                preprocessor=preprocessor,
-                postprocessor=postprocessor,
-                dataset=dataset,
-                control_time_s=cfg.dataset.episode_time_s,
-                single_task=cfg.dataset.single_task,
-                display_data=cfg.display_data,
-            )
+    if intervention_dataset is not None:
+        # === INTERVENTION-ONLY MODE ===
+        # Main dataset is just a scratch buffer for policy features, never saved/encoded.
+        # Only intervention episodes are tracked, saved, and encoded.
+        with VideoEncodingManager(intervention_dataset):
+            recorded_episodes = 0
+            while recorded_episodes < cfg.dataset.num_episodes and not events["stop_recording"]:
+                log_say(f"Intervention episode {recorded_episodes}", cfg.play_sounds)
 
-            # Execute a few seconds without recording to give time to manually reset the environment
-            # Skip reset for the last episode to be recorded
-            if not events["stop_recording"] and (
-                (recorded_episodes < cfg.dataset.num_episodes - 1) or events["rerecord_episode"]
-            ):
-                log_say("Reset the environment", cfg.play_sounds)
+                # Run policy (user can press SPACE to intervene, right arrow to save)
                 record_loop(
                     robot=robot,
                     events=events,
@@ -507,22 +698,136 @@ def record(cfg: RecordConfig) -> LeRobotDataset:
                     robot_action_processor=robot_action_processor,
                     robot_observation_processor=robot_observation_processor,
                     teleop=teleop,
-                    control_time_s=cfg.dataset.reset_time_s,
+                    policy=policy,
+                    preprocessor=preprocessor,
+                    postprocessor=postprocessor,
+                    dataset=dataset,
+                    control_time_s=cfg.dataset.episode_time_s,
+                    single_task=cfg.dataset.single_task,
+                    display_data=cfg.display_data,
+                    intervention_dataset=intervention_dataset,
+                    is_reset_phase=False,
+                )
+
+                # Check if an intervention episode is ready to be saved
+                # (user pressed right arrow during intervention)
+                intervention_ready = (
+                    hasattr(record_loop, "intervention_episode_started")
+                    and record_loop.intervention_episode_started
+                )
+
+                if not intervention_ready:
+                    # No intervention happened (right arrow during policy mode)
+                    # Just restart the run
+                    events["rerecord_episode"] = False
+                    continue
+
+                # Safety: if rerecord_episode leaked through (shouldn't happen normally
+                # since left arrow during intervention is handled inside record_loop)
+                if events["rerecord_episode"]:
+                    events["rerecord_episode"] = False
+                    events["exit_early"] = False
+                    intervention_dataset.clear_episode_buffer()
+                    record_loop.intervention_episode_started = False
+                    continue
+
+                # Reset environment phase (only reached via right arrow during intervention)
+                if not events["stop_recording"]:
+                    log_say("Reset the environment", cfg.play_sounds)
+                    record_loop(
+                        robot=robot,
+                        events=events,
+                        fps=cfg.dataset.fps,
+                        teleop_action_processor=teleop_action_processor,
+                        robot_action_processor=robot_action_processor,
+                        robot_observation_processor=robot_observation_processor,
+                        teleop=teleop,
+                        control_time_s=cfg.dataset.reset_time_s,
+                        single_task=cfg.dataset.single_task,
+                        display_data=cfg.display_data,
+                        intervention_dataset=intervention_dataset,
+                        is_reset_phase=True,
+                    )
+
+                # After reset: check if user wants to redo (left arrow during reset)
+                if events["rerecord_episode"]:
+                    log_say("Discarding intervention episode", cfg.play_sounds)
+                    events["rerecord_episode"] = False
+                    events["exit_early"] = False
+                    # Discard the intervention buffer
+                    intervention_dataset.clear_episode_buffer()
+                    record_loop.intervention_episode_started = False
+                    continue
+
+                # Save the intervention episode
+                intervention_dataset.save_episode()
+                record_loop.intervention_episode_started = False
+                recorded_episodes += 1
+                log_say(f"Saved {recorded_episodes} intervention episodes", cfg.play_sounds)
+
+        log_say("Stop recording", cfg.play_sounds, blocking=True)
+
+        # Push intervention dataset to hub if configured
+        if cfg.dataset.push_to_hub:
+            intervention_dataset.push_to_hub(tags=cfg.dataset.tags, private=cfg.dataset.private)
+            logging.info(f"Pushed intervention dataset to hub: {cfg.dataset.intervention_repo_id}")
+
+    else:
+        # === NORMAL RECORDING MODE ===
+        # Standard behavior: record episodes to main dataset
+        with VideoEncodingManager(dataset):
+            recorded_episodes = 0
+            while recorded_episodes < cfg.dataset.num_episodes and not events["stop_recording"]:
+                log_say(f"Recording episode {dataset.num_episodes}", cfg.play_sounds)
+                record_loop(
+                    robot=robot,
+                    events=events,
+                    fps=cfg.dataset.fps,
+                    teleop_action_processor=teleop_action_processor,
+                    robot_action_processor=robot_action_processor,
+                    robot_observation_processor=robot_observation_processor,
+                    teleop=teleop,
+                    policy=policy,
+                    preprocessor=preprocessor,
+                    postprocessor=postprocessor,
+                    dataset=dataset,
+                    control_time_s=cfg.dataset.episode_time_s,
                     single_task=cfg.dataset.single_task,
                     display_data=cfg.display_data,
                 )
 
-            if events["rerecord_episode"]:
-                log_say("Re-record episode", cfg.play_sounds)
-                events["rerecord_episode"] = False
-                events["exit_early"] = False
-                dataset.clear_episode_buffer()
-                continue
+                # Reset environment phase
+                if not events["stop_recording"] and (
+                    (recorded_episodes < cfg.dataset.num_episodes - 1) or events["rerecord_episode"]
+                ):
+                    log_say("Reset the environment", cfg.play_sounds)
+                    record_loop(
+                        robot=robot,
+                        events=events,
+                        fps=cfg.dataset.fps,
+                        teleop_action_processor=teleop_action_processor,
+                        robot_action_processor=robot_action_processor,
+                        robot_observation_processor=robot_observation_processor,
+                        teleop=teleop,
+                        control_time_s=cfg.dataset.reset_time_s,
+                        single_task=cfg.dataset.single_task,
+                        display_data=cfg.display_data,
+                    )
 
-            dataset.save_episode()
-            recorded_episodes += 1
+                if events["rerecord_episode"]:
+                    log_say("Re-record episode", cfg.play_sounds)
+                    events["rerecord_episode"] = False
+                    events["exit_early"] = False
+                    dataset.clear_episode_buffer()
+                    continue
 
-    log_say("Stop recording", cfg.play_sounds, blocking=True)
+                dataset.save_episode()
+                recorded_episodes += 1
+
+        log_say("Stop recording", cfg.play_sounds, blocking=True)
+
+        if cfg.dataset.push_to_hub:
+            dataset.push_to_hub(tags=cfg.dataset.tags, private=cfg.dataset.private)
 
     robot.disconnect()
     if teleop is not None:
@@ -530,9 +835,6 @@ def record(cfg: RecordConfig) -> LeRobotDataset:
 
     if not is_headless() and listener is not None:
         listener.stop()
-
-    if cfg.dataset.push_to_hub:
-        dataset.push_to_hub(tags=cfg.dataset.tags, private=cfg.dataset.private)
 
     log_say("Exiting", cfg.play_sounds)
     return dataset

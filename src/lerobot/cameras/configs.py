@@ -38,6 +38,11 @@ class CameraConfig(draccus.ChoiceRegistry, abc.ABC):  # type: ignore  # TODO: ad
     fps: int | None = None
     width: int | None = None
     height: int | None = None
+    # Optional: the name the policy expects for this camera (e.g., "image").
+    # If set, observations are automatically renamed from the descriptive camera name
+    # to this policy name before being fed to the policy during inference.
+    # The dataset retains the descriptive camera name.
+    policy_camera_name: str | None = None
 
     @property
     def type(self) -> str:
