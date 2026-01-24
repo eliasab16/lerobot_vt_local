@@ -27,6 +27,8 @@ lerobot-record \
     --dataset.num_episodes=2 \
     --dataset.single_task="Grab the cube" \
     --display_data=true
+    # <- Optional: specify video codec (h264, hevc, libsvtav1). Default is libsvtav1. \
+    # --dataset.vcodec=h264 \
     # <- Teleop optional if you want to teleoperate to record or in between episodes with a policy \
     # --teleop.type=so100_leader \
     # --teleop.port=/dev/tty.usbmodem58760431551 \
@@ -38,21 +40,23 @@ lerobot-record \
 Example recording with bimanual so100:
 ```shell
 lerobot-record \
-  --robot.type=bi_so100_follower \
-  --robot.left_arm_port=/dev/tty.usbmodem5A460851411 \
-  --robot.right_arm_port=/dev/tty.usbmodem5A460812391 \
+  --robot.type=bi_so_follower \
+  --robot.left_arm_config.port=/dev/tty.usbmodem5A460822851 \
+  --robot.right_arm_config.port=/dev/tty.usbmodem5A460814411 \
   --robot.id=bimanual_follower \
-  --robot.cameras='{
-    left: {"type": "opencv", "index_or_path": 0, "width": 640, "height": 480, "fps": 30},
-    top: {"type": "opencv", "index_or_path": 1, "width": 640, "height": 480, "fps": 30},
-    right: {"type": "opencv", "index_or_path": 2, "width": 640, "height": 480, "fps": 30}
+  --robot.left_arm_config.cameras='{
+    wrist: {"type": "opencv", "index_or_path": 1, "width": 640, "height": 480, "fps": 30},
+    top: {"type": "opencv", "index_or_path": 3, "width": 640, "height": 480, "fps": 30},
+  }' --robot.right_arm_config.cameras='{
+    wrist: {"type": "opencv", "index_or_path": 2, "width": 640, "height": 480, "fps": 30},
+    front: {"type": "opencv", "index_or_path": 4, "width": 640, "height": 480, "fps": 30},
   }' \
-  --teleop.type=bi_so100_leader \
-  --teleop.left_arm_port=/dev/tty.usbmodem5A460828611 \
-  --teleop.right_arm_port=/dev/tty.usbmodem5A460826981 \
+  --teleop.type=bi_so_leader \
+  --teleop.left_arm_config.port=/dev/tty.usbmodem5A460852721 \
+  --teleop.right_arm_config.port=/dev/tty.usbmodem5A460819811 \
   --teleop.id=bimanual_leader \
   --display_data=true \
-  --dataset.repo_id=${HF_USER}/bimanual-so100-handover-cube \
+  --dataset.repo_id=${HF_USER}/bimanual-so-handover-cube \
   --dataset.num_episodes=25 \
   --dataset.single_task="Grab and handover the red cube to the other arm"
 ```
@@ -71,7 +75,9 @@ from lerobot.cameras import (  # noqa: F401
     CameraConfig,  # noqa: F401
 )
 from lerobot.cameras.opencv.configuration_opencv import OpenCVCameraConfig  # noqa: F401
+from lerobot.cameras.reachy2_camera.configuration_reachy2_camera import Reachy2CameraConfig  # noqa: F401
 from lerobot.cameras.realsense.configuration_realsense import RealSenseCameraConfig  # noqa: F401
+from lerobot.cameras.zmq.configuration_zmq import ZMQCameraConfig  # noqa: F401
 from lerobot.configs import parser
 from lerobot.configs.policies import PreTrainedConfig
 from lerobot.datasets.image_writer import safe_stop_image_writer
@@ -94,23 +100,26 @@ from lerobot.processor.rename_processor import rename_stats
 from lerobot.robots import (  # noqa: F401
     Robot,
     RobotConfig,
-    bi_so100_follower,
+    bi_so_follower,
     earthrover_mini_plus,
     hope_jr,
     koch_follower,
     make_robot_from_config,
-    so100_follower,
-    so101_follower,
+    omx_follower,
+    reachy2,
+    so_follower,
+    unitree_g1,
 )
 from lerobot.teleoperators import (  # noqa: F401
     Teleoperator,
     TeleoperatorConfig,
-    bi_so100_leader,
+    bi_so_leader,
     homunculus,
     koch_leader,
     make_teleoperator_from_config,
-    so100_leader,
-    so101_leader,
+    omx_leader,
+    reachy2_teleoperator,
+    so_leader,
 )
 from lerobot.teleoperators.keyboard.teleop_keyboard import KeyboardTeleop
 from lerobot.utils.constants import ACTION, OBS_STR
@@ -167,6 +176,9 @@ class DatasetRecordConfig:
     # Number of episodes to record before batch encoding videos
     # Set to 1 for immediate encoding (default behavior), or higher for batched encoding
     video_encoding_batch_size: int = 1
+    # Video codec for encoding videos. Options: 'h264', 'hevc', 'libsvtav1'.
+    # Use 'h264' for faster encoding on systems where AV1 encoding is CPU-heavy.
+    vcodec: str = "libsvtav1"
     # Rename map for the observation to override the image and state keys
     rename_map: dict[str, str] = field(default_factory=dict)
     # Repository ID for saving intervention-only recordings when toggling from policy to teleop mode
@@ -198,6 +210,12 @@ class RecordConfig:
     frame_processor: FrameProcessorConfig | None = None
     # Display all cameras on screen
     display_data: bool = False
+    # Display data on a remote Rerun server
+    display_ip: str | None = None
+    # Port of the remote Rerun server
+    display_port: int | None = None
+    # Whether to  display compressed images in Rerun
+    display_compressed_images: bool = False
     # Use vocal synthesis to read events.
     play_sounds: bool = True
     # Resume recording on an existing dataset.
@@ -206,8 +224,10 @@ class RecordConfig:
     def __post_init__(self):
         # HACK: We parse again the cli args here to get the pretrained path if there was one.
         policy_path = parser.get_path_arg("policy")
+
         if policy_path:
             cli_overrides = parser.get_cli_overrides("policy")
+
             self.policy = PreTrainedConfig.from_pretrained(policy_path, cli_overrides=cli_overrides)
             self.policy.pretrained_path = policy_path
 
@@ -272,6 +292,7 @@ def record_loop(
     control_time_s: int | None = None,
     single_task: str | None = None,
     display_data: bool = False,
+    display_compressed_images: bool = False,
     intervention_dataset: LeRobotDataset | None = None,
     is_reset_phase: bool = False,
 ):
@@ -307,7 +328,12 @@ def record_loop(
                 for t in teleop
                 if isinstance(
                     t,
-                    (so100_leader.SO100Leader | so101_leader.SO101Leader | koch_leader.KochLeader),
+                    (
+                        so_leader.SO100Leader
+                        | so_leader.SO101Leader
+                        | koch_leader.KochLeader
+                        | omx_leader.OmxLeader
+                    ),
                 )
             ),
             None,
@@ -518,10 +544,12 @@ def record_loop(
             dataset.add_frame(frame)
 
         if display_data:
-            log_rerun_data(observation=obs_processed, action=action_values)
+            log_rerun_data(
+                observation=obs_processed, action=action_values, compress_images=display_compressed_images
+            )
 
         dt_s = time.perf_counter() - start_loop_t
-        precise_sleep(1 / fps - dt_s)
+        precise_sleep(max(1 / fps - dt_s, 0.0))
 
         timestamp = time.perf_counter() - start_episode_t
 
@@ -531,7 +559,12 @@ def record(cfg: RecordConfig) -> LeRobotDataset:
     init_logging()
     logging.info(pformat(asdict(cfg)))
     if cfg.display_data:
-        init_rerun(session_name="recording")
+        init_rerun(session_name="recording", ip=cfg.display_ip, port=cfg.display_port)
+    display_compressed_images = (
+        True
+        if (cfg.display_data and cfg.display_ip is not None and cfg.display_port is not None)
+        else cfg.display_compressed_images
+    )
 
 
     robot = make_robot_from_config(cfg.robot)
@@ -561,59 +594,30 @@ def record(cfg: RecordConfig) -> LeRobotDataset:
         ),
     )
 
-    if cfg.resume:
-        dataset = LeRobotDataset(
-            cfg.dataset.repo_id,
-            root=cfg.dataset.root,
-            batch_encoding_size=cfg.dataset.video_encoding_batch_size,
-        )
-
-        if hasattr(robot, "cameras") and len(robot.cameras) > 0:
-            dataset.start_image_writer(
-                num_processes=cfg.dataset.num_image_writer_processes,
-                num_threads=cfg.dataset.num_image_writer_threads_per_camera * len(robot.cameras),
-            )
-        sanity_check_dataset_robot_compatibility(dataset, robot, cfg.dataset.fps, dataset_features)
-    else:
-        # Create empty dataset or load existing saved episodes
-        sanity_check_dataset_name(cfg.dataset.repo_id, cfg.policy)
-        dataset = LeRobotDataset.create(
-            cfg.dataset.repo_id,
-            cfg.dataset.fps,
-            root=cfg.dataset.root,
-            robot_type=robot.name,
-            features=dataset_features,
-            use_videos=cfg.dataset.video,
-            image_writer_processes=cfg.dataset.num_image_writer_processes,
-            image_writer_threads=cfg.dataset.num_image_writer_threads_per_camera * len(robot.cameras),
-            batch_encoding_size=cfg.dataset.video_encoding_batch_size,
-        )
-
-    # Create intervention dataset if specified
+    dataset = None
+    listener = None
     intervention_dataset = None
-    if cfg.dataset.intervention_repo_id is not None:
-        if cfg.resume:
-            # Resume existing intervention dataset
-            try:
-                intervention_dataset = LeRobotDataset(
-                    cfg.dataset.intervention_repo_id,
-                    root=cfg.dataset.root,
-                    batch_encoding_size=cfg.dataset.video_encoding_batch_size,
-                )
-                if hasattr(robot, "cameras") and len(robot.cameras) > 0:
-                    intervention_dataset.start_image_writer(
-                        num_processes=cfg.dataset.num_image_writer_processes,
-                        num_threads=cfg.dataset.num_image_writer_threads_per_camera * len(robot.cameras),
-                    )
-                logging.info(f"Resumed intervention dataset: {cfg.dataset.intervention_repo_id}")
-            except Exception as e:
-                logging.warning(f"Could not resume intervention dataset: {e}. Creating new one.")
-                intervention_dataset = None
 
-        if intervention_dataset is None:
-            # Create new intervention dataset
-            intervention_dataset = LeRobotDataset.create(
-                cfg.dataset.intervention_repo_id,
+    try:
+        if cfg.resume:
+            dataset = LeRobotDataset(
+                cfg.dataset.repo_id,
+                root=cfg.dataset.root,
+                batch_encoding_size=cfg.dataset.video_encoding_batch_size,
+                vcodec=cfg.dataset.vcodec,
+            )
+
+            if hasattr(robot, "cameras") and len(robot.cameras) > 0:
+                dataset.start_image_writer(
+                    num_processes=cfg.dataset.num_image_writer_processes,
+                    num_threads=cfg.dataset.num_image_writer_threads_per_camera * len(robot.cameras),
+                )
+            sanity_check_dataset_robot_compatibility(dataset, robot, cfg.dataset.fps, dataset_features)
+        else:
+            # Create empty dataset or load existing saved episodes
+            sanity_check_dataset_name(cfg.dataset.repo_id, cfg.policy)
+            dataset = LeRobotDataset.create(
+                cfg.dataset.repo_id,
                 cfg.dataset.fps,
                 root=cfg.dataset.root,
                 robot_type=robot.name,
@@ -622,118 +626,111 @@ def record(cfg: RecordConfig) -> LeRobotDataset:
                 image_writer_processes=cfg.dataset.num_image_writer_processes,
                 image_writer_threads=cfg.dataset.num_image_writer_threads_per_camera * len(robot.cameras),
                 batch_encoding_size=cfg.dataset.video_encoding_batch_size,
+                vcodec=cfg.dataset.vcodec,
             )
-            logging.info(f"Created intervention dataset: {cfg.dataset.intervention_repo_id}")
 
-    # Build rename_map from policy_camera_name fields in camera configs
-    # This maps descriptive dataset keys to policy-expected keys
-    camera_rename_map = {}
-    if hasattr(robot, "config") and hasattr(robot.config, "cameras"):
-        for cam_name, cam_config in robot.config.cameras.items():
-            if hasattr(cam_config, "policy_camera_name") and cam_config.policy_camera_name:
-                camera_rename_map[f"observation.images.{cam_name}"] = (
-                    f"observation.images.{cam_config.policy_camera_name}"
+        # Create intervention dataset if specified
+        if cfg.dataset.intervention_repo_id is not None:
+            if cfg.resume:
+                # Resume existing intervention dataset
+                try:
+                    intervention_dataset = LeRobotDataset(
+                        cfg.dataset.intervention_repo_id,
+                        root=cfg.dataset.root,
+                        batch_encoding_size=cfg.dataset.video_encoding_batch_size,
+                        vcodec=cfg.dataset.vcodec,
+                    )
+                    if hasattr(robot, "cameras") and len(robot.cameras) > 0:
+                        intervention_dataset.start_image_writer(
+                            num_processes=cfg.dataset.num_image_writer_processes,
+                            num_threads=cfg.dataset.num_image_writer_threads_per_camera * len(robot.cameras),
+                        )
+                    logging.info(f"Resumed intervention dataset: {cfg.dataset.intervention_repo_id}")
+                except Exception as e:
+                    logging.warning(f"Could not resume intervention dataset: {e}. Creating new one.")
+                    intervention_dataset = None
+
+            if intervention_dataset is None:
+                # Create new intervention dataset
+                intervention_dataset = LeRobotDataset.create(
+                    cfg.dataset.intervention_repo_id,
+                    cfg.dataset.fps,
+                    root=cfg.dataset.root,
+                    robot_type=robot.name,
+                    features=dataset_features,
+                    use_videos=cfg.dataset.video,
+                    image_writer_processes=cfg.dataset.num_image_writer_processes,
+                    image_writer_threads=cfg.dataset.num_image_writer_threads_per_camera * len(robot.cameras),
+                    batch_encoding_size=cfg.dataset.video_encoding_batch_size,
+                    vcodec=cfg.dataset.vcodec,
                 )
-    # Merge with any explicit rename_map from dataset config (explicit takes precedence)
-    rename_map = {**camera_rename_map, **cfg.dataset.rename_map}
+                logging.info(f"Created intervention dataset: {cfg.dataset.intervention_repo_id}")
 
-    # Load pretrained policy
-    policy = None if cfg.policy is None else make_policy(
-        cfg.policy, ds_meta=dataset.meta, rename_map=rename_map or None
-    )
-    preprocessor = None
-    postprocessor = None
-    if cfg.policy is not None:
-        preprocessor, postprocessor = make_pre_post_processors(
-            policy_cfg=cfg.policy,
-            pretrained_path=cfg.policy.pretrained_path,
-            dataset_stats=rename_stats(dataset.meta.stats, rename_map),
-            preprocessor_overrides={
-                "device_processor": {"device": cfg.policy.device},
-                "rename_observations_processor": {"rename_map": rename_map},
-            },
+        # Build rename_map from policy_camera_name fields in camera configs
+        # This maps descriptive dataset keys to policy-expected keys
+        camera_rename_map = {}
+        if hasattr(robot, "config") and hasattr(robot.config, "cameras"):
+            for cam_name, cam_config in robot.config.cameras.items():
+                if hasattr(cam_config, "policy_camera_name") and cam_config.policy_camera_name:
+                    camera_rename_map[f"observation.images.{cam_name}"] = (
+                        f"observation.images.{cam_config.policy_camera_name}"
+                    )
+        # Merge with any explicit rename_map from dataset config (explicit takes precedence)
+        rename_map = {**camera_rename_map, **cfg.dataset.rename_map}
+
+        # Load pretrained policy
+        policy = None if cfg.policy is None else make_policy(
+            cfg.policy, ds_meta=dataset.meta, rename_map=rename_map or None
         )
-
-    # Initialize frame processor if configured
-    if cfg.frame_processor is not None:
-        try:
-            sys.path.insert(0, '/Users/elisd/Desktop/vult/vt-src')
-            FrameProcessorRegistry.initialize(
-                cfg.frame_processor.type,
-                cfg.frame_processor.config
+        preprocessor = None
+        postprocessor = None
+        if cfg.policy is not None:
+            preprocessor, postprocessor = make_pre_post_processors(
+                policy_cfg=cfg.policy,
+                pretrained_path=cfg.policy.pretrained_path,
+                dataset_stats=rename_stats(dataset.meta.stats, rename_map),
+                preprocessor_overrides={
+                    "device_processor": {"device": cfg.policy.device},
+                    "rename_observations_processor": {"rename_map": rename_map},
+                },
             )
-            logging.info(f"Frame processor '{cfg.frame_processor.type}' initialized")
-        except Exception as e:
-            raise RuntimeError(f"Failed to initialize frame processor: {e}") from e
 
-    robot.connect()
-    if teleop is not None:
-        teleop.connect()
-
-        # Enable torque on leader when using a policy so it can mirror the follower
-        if policy is not None and isinstance(teleop, Teleoperator) and hasattr(teleop, "bus"):
+        # Initialize frame processor if configured
+        if cfg.frame_processor is not None:
             try:
-                teleop.bus.enable_torque(num_retry=5)
-                logging.info("Leader torque enabled for policy mirroring")
+                sys.path.insert(0, '/Users/elisd/Desktop/vult/vt-src')
+                FrameProcessorRegistry.initialize(
+                    cfg.frame_processor.type,
+                    cfg.frame_processor.config
+                )
+                logging.info(f"Frame processor '{cfg.frame_processor.type}' initialized")
             except Exception as e:
-                logging.warning(f"Failed to enable leader torque for mirroring: {e}")
+                raise RuntimeError(f"Failed to initialize frame processor: {e}") from e
 
-    listener, events = init_keyboard_listener()
+        robot.connect()
+        if teleop is not None:
+            teleop.connect()
 
-    if intervention_dataset is not None:
-        # === INTERVENTION-ONLY MODE ===
-        # Main dataset is just a scratch buffer for policy features, never saved/encoded.
-        # Only intervention episodes are tracked, saved, and encoded.
-        with VideoEncodingManager(intervention_dataset):
-            recorded_episodes = 0
-            while recorded_episodes < cfg.dataset.num_episodes and not events["stop_recording"]:
-                log_say(f"Intervention episode {recorded_episodes}", cfg.play_sounds)
+            # Enable torque on leader when using a policy so it can mirror the follower
+            if policy is not None and isinstance(teleop, Teleoperator) and hasattr(teleop, "bus"):
+                try:
+                    teleop.bus.enable_torque(num_retry=5)
+                    logging.info("Leader torque enabled for policy mirroring")
+                except Exception as e:
+                    logging.warning(f"Failed to enable leader torque for mirroring: {e}")
 
-                # Run policy (user can press SPACE to intervene, right arrow to save)
-                record_loop(
-                    robot=robot,
-                    events=events,
-                    fps=cfg.dataset.fps,
-                    teleop_action_processor=teleop_action_processor,
-                    robot_action_processor=robot_action_processor,
-                    robot_observation_processor=robot_observation_processor,
-                    teleop=teleop,
-                    policy=policy,
-                    preprocessor=preprocessor,
-                    postprocessor=postprocessor,
-                    dataset=dataset,
-                    control_time_s=cfg.dataset.episode_time_s,
-                    single_task=cfg.dataset.single_task,
-                    display_data=cfg.display_data,
-                    intervention_dataset=intervention_dataset,
-                    is_reset_phase=False,
-                )
+        listener, events = init_keyboard_listener()
 
-                # Check if an intervention episode is ready to be saved
-                # (user pressed right arrow during intervention)
-                intervention_ready = (
-                    hasattr(record_loop, "intervention_episode_started")
-                    and record_loop.intervention_episode_started
-                )
+        if intervention_dataset is not None:
+            # === INTERVENTION-ONLY MODE ===
+            # Main dataset is just a scratch buffer for policy features, never saved/encoded.
+            # Only intervention episodes are tracked, saved, and encoded.
+            with VideoEncodingManager(intervention_dataset):
+                recorded_episodes = 0
+                while recorded_episodes < cfg.dataset.num_episodes and not events["stop_recording"]:
+                    log_say(f"Intervention episode {recorded_episodes}", cfg.play_sounds)
 
-                if not intervention_ready:
-                    # No intervention happened (right arrow during policy mode)
-                    # Just restart the run
-                    events["rerecord_episode"] = False
-                    continue
-
-                # Safety: if rerecord_episode leaked through (shouldn't happen normally
-                # since left arrow during intervention is handled inside record_loop)
-                if events["rerecord_episode"]:
-                    events["rerecord_episode"] = False
-                    events["exit_early"] = False
-                    intervention_dataset.clear_episode_buffer()
-                    record_loop.intervention_episode_started = False
-                    continue
-
-                # Reset environment phase (only reached via right arrow during intervention)
-                if not events["stop_recording"]:
-                    log_say("Reset the environment", cfg.play_sounds)
+                    # Run policy (user can press SPACE to intervene, right arrow to save)
                     record_loop(
                         robot=robot,
                         events=events,
@@ -742,65 +739,87 @@ def record(cfg: RecordConfig) -> LeRobotDataset:
                         robot_action_processor=robot_action_processor,
                         robot_observation_processor=robot_observation_processor,
                         teleop=teleop,
-                        control_time_s=cfg.dataset.reset_time_s,
+                        policy=policy,
+                        preprocessor=preprocessor,
+                        postprocessor=postprocessor,
+                        dataset=dataset,
+                        control_time_s=cfg.dataset.episode_time_s,
                         single_task=cfg.dataset.single_task,
                         display_data=cfg.display_data,
+                        display_compressed_images=display_compressed_images,
                         intervention_dataset=intervention_dataset,
-                        is_reset_phase=True,
+                        is_reset_phase=False,
                     )
 
-                # After reset: check if user wants to redo (left arrow during reset)
-                if events["rerecord_episode"]:
-                    log_say("Discarding intervention episode", cfg.play_sounds)
-                    events["rerecord_episode"] = False
-                    events["exit_early"] = False
-                    # Discard the intervention buffer
-                    intervention_dataset.clear_episode_buffer()
+                    # Check if an intervention episode is ready to be saved
+                    # (user pressed right arrow during intervention)
+                    intervention_ready = (
+                        hasattr(record_loop, "intervention_episode_started")
+                        and record_loop.intervention_episode_started
+                    )
+
+                    if not intervention_ready:
+                        # No intervention happened (right arrow during policy mode)
+                        # Just restart the run
+                        events["rerecord_episode"] = False
+                        continue
+
+                    # Safety: if rerecord_episode leaked through (shouldn't happen normally
+                    # since left arrow during intervention is handled inside record_loop)
+                    if events["rerecord_episode"]:
+                        events["rerecord_episode"] = False
+                        events["exit_early"] = False
+                        intervention_dataset.clear_episode_buffer()
+                        record_loop.intervention_episode_started = False
+                        continue
+
+                    # Reset environment phase (only reached via right arrow during intervention)
+                    if not events["stop_recording"]:
+                        log_say("Reset the environment", cfg.play_sounds)
+
+                        # reset g1 robot
+                        if robot.name == "unitree_g1":
+                            robot.reset()
+
+                        record_loop(
+                            robot=robot,
+                            events=events,
+                            fps=cfg.dataset.fps,
+                            teleop_action_processor=teleop_action_processor,
+                            robot_action_processor=robot_action_processor,
+                            robot_observation_processor=robot_observation_processor,
+                            teleop=teleop,
+                            control_time_s=cfg.dataset.reset_time_s,
+                            single_task=cfg.dataset.single_task,
+                            display_data=cfg.display_data,
+                            display_compressed_images=display_compressed_images,
+                            intervention_dataset=intervention_dataset,
+                            is_reset_phase=True,
+                        )
+
+                    # After reset: check if user wants to redo (left arrow during reset)
+                    if events["rerecord_episode"]:
+                        log_say("Discarding intervention episode", cfg.play_sounds)
+                        events["rerecord_episode"] = False
+                        events["exit_early"] = False
+                        # Discard the intervention buffer
+                        intervention_dataset.clear_episode_buffer()
+                        record_loop.intervention_episode_started = False
+                        continue
+
+                    # Save the intervention episode
+                    intervention_dataset.save_episode()
                     record_loop.intervention_episode_started = False
-                    continue
+                    recorded_episodes += 1
+                    log_say(f"Saved {recorded_episodes} intervention episodes", cfg.play_sounds)
 
-                # Save the intervention episode
-                intervention_dataset.save_episode()
-                record_loop.intervention_episode_started = False
-                recorded_episodes += 1
-                log_say(f"Saved {recorded_episodes} intervention episodes", cfg.play_sounds)
-
-        log_say("Stop recording", cfg.play_sounds, blocking=True)
-
-        # Push intervention dataset to hub if configured
-        if cfg.dataset.push_to_hub:
-            intervention_dataset.push_to_hub(tags=cfg.dataset.tags, private=cfg.dataset.private)
-            logging.info(f"Pushed intervention dataset to hub: {cfg.dataset.intervention_repo_id}")
-
-    else:
-        # === NORMAL RECORDING MODE ===
-        # Standard behavior: record episodes to main dataset
-        with VideoEncodingManager(dataset):
-            recorded_episodes = 0
-            while recorded_episodes < cfg.dataset.num_episodes and not events["stop_recording"]:
-                log_say(f"Recording episode {dataset.num_episodes}", cfg.play_sounds)
-                record_loop(
-                    robot=robot,
-                    events=events,
-                    fps=cfg.dataset.fps,
-                    teleop_action_processor=teleop_action_processor,
-                    robot_action_processor=robot_action_processor,
-                    robot_observation_processor=robot_observation_processor,
-                    teleop=teleop,
-                    policy=policy,
-                    preprocessor=preprocessor,
-                    postprocessor=postprocessor,
-                    dataset=dataset,
-                    control_time_s=cfg.dataset.episode_time_s,
-                    single_task=cfg.dataset.single_task,
-                    display_data=cfg.display_data,
-                )
-
-                # Reset environment phase
-                if not events["stop_recording"] and (
-                    (recorded_episodes < cfg.dataset.num_episodes - 1) or events["rerecord_episode"]
-                ):
-                    log_say("Reset the environment", cfg.play_sounds)
+        else:
+            # === NORMAL RECORDING MODE ===
+            # Standard behavior: record episodes to main dataset
+            with VideoEncodingManager(dataset):
+                recorded_episodes = 0
+                while recorded_episodes < cfg.dataset.num_episodes and not events["stop_recording"]:
+                    log_say(f"Recording episode {dataset.num_episodes}", cfg.play_sounds)
                     record_loop(
                         robot=robot,
                         events=events,
@@ -809,34 +828,72 @@ def record(cfg: RecordConfig) -> LeRobotDataset:
                         robot_action_processor=robot_action_processor,
                         robot_observation_processor=robot_observation_processor,
                         teleop=teleop,
-                        control_time_s=cfg.dataset.reset_time_s,
+                        policy=policy,
+                        preprocessor=preprocessor,
+                        postprocessor=postprocessor,
+                        dataset=dataset,
+                        control_time_s=cfg.dataset.episode_time_s,
                         single_task=cfg.dataset.single_task,
                         display_data=cfg.display_data,
+                        display_compressed_images=display_compressed_images,
                     )
 
-                if events["rerecord_episode"]:
-                    log_say("Re-record episode", cfg.play_sounds)
-                    events["rerecord_episode"] = False
-                    events["exit_early"] = False
-                    dataset.clear_episode_buffer()
-                    continue
+                    # Skip reset for the last episode to be recorded
+                    if not events["stop_recording"] and (
+                        (recorded_episodes < cfg.dataset.num_episodes - 1) or events["rerecord_episode"]
+                    ):
+                        log_say("Reset the environment", cfg.play_sounds)
 
-                dataset.save_episode()
-                recorded_episodes += 1
+                        # reset g1 robot
+                        if robot.name == "unitree_g1":
+                            robot.reset()
 
+                        record_loop(
+                            robot=robot,
+                            events=events,
+                            fps=cfg.dataset.fps,
+                            teleop_action_processor=teleop_action_processor,
+                            robot_action_processor=robot_action_processor,
+                            robot_observation_processor=robot_observation_processor,
+                            teleop=teleop,
+                            control_time_s=cfg.dataset.reset_time_s,
+                            single_task=cfg.dataset.single_task,
+                            display_data=cfg.display_data,
+                            display_compressed_images=display_compressed_images,
+                        )
+
+                    if events["rerecord_episode"]:
+                        log_say("Re-record episode", cfg.play_sounds)
+                        events["rerecord_episode"] = False
+                        events["exit_early"] = False
+                        dataset.clear_episode_buffer()
+                        continue
+
+                    dataset.save_episode()
+                    recorded_episodes += 1
+
+    finally:
         log_say("Stop recording", cfg.play_sounds, blocking=True)
 
+        if dataset:
+            dataset.finalize()
+
+        if robot.is_connected:
+            robot.disconnect()
+        if teleop and teleop.is_connected:
+            teleop.disconnect()
+
+        if not is_headless() and listener:
+            listener.stop()
+
         if cfg.dataset.push_to_hub:
-            dataset.push_to_hub(tags=cfg.dataset.tags, private=cfg.dataset.private)
+            if intervention_dataset is not None:
+                intervention_dataset.push_to_hub(tags=cfg.dataset.tags, private=cfg.dataset.private)
+                logging.info(f"Pushed intervention dataset to hub: {cfg.dataset.intervention_repo_id}")
+            else:
+                dataset.push_to_hub(tags=cfg.dataset.tags, private=cfg.dataset.private)
 
-    robot.disconnect()
-    if teleop is not None:
-        teleop.disconnect()
-
-    if not is_headless() and listener is not None:
-        listener.stop()
-
-    log_say("Exiting", cfg.play_sounds)
+        log_say("Exiting", cfg.play_sounds)
     return dataset
 
 
