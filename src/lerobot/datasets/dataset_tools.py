@@ -89,12 +89,20 @@ def _load_episode_with_stats(src_dataset: LeRobotDataset, episode_idx: int) -> d
     file_idx = ep_meta["meta/episodes/file_index"]
 
     parquet_path = src_dataset.root / DEFAULT_EPISODES_PATH.format(chunk_index=chunk_idx, file_index=file_idx)
-    df = pd.read_parquet(parquet_path)
-    df = _convert_extension_dtypes_to_numpy(df)
-
-    episode_row = df[df["episode_index"] == episode_idx].iloc[0]
-
-    return episode_row.to_dict()
+    
+    # Use pyarrow directly to avoid pandas dtype conversion issues with nested list types
+    # (e.g., 'list<element: list<element: list<element: double>>>' for image stats)
+    table = pq.read_table(parquet_path)
+    
+    # Find the row matching the episode_idx
+    episode_indices = table.column("episode_index").to_pylist()
+    try:
+        row_idx = episode_indices.index(episode_idx)
+    except ValueError:
+        raise ValueError(f"Episode {episode_idx} not found in {parquet_path}")
+    
+    # Convert row to dict using PyArrow's native .as_py() which handles nested types correctly
+    return {col: table.column(col)[row_idx].as_py() for col in table.column_names}
 
 
 def delete_episodes(
@@ -844,6 +852,7 @@ def _copy_and_reindex_episodes_metadata(
         src_dataset.meta.episodes = load_episodes(src_dataset.meta.root)
 
     all_stats = []
+    all_episode_dicts = []  # Collect all episodes first to write with unified schema
     total_frames = 0
 
     for old_idx, new_idx in tqdm(
@@ -875,6 +884,10 @@ def _copy_and_reindex_episodes_metadata(
                         episode_stats[feature_name] = {}
 
                     value = src_episode_full[key]
+                    
+                    # Convert lists to numpy arrays (pyarrow's .as_py() returns lists)
+                    if isinstance(value, list):
+                        value = np.array(value)
 
                     if feature_name in src_dataset.meta.features:
                         feature_dtype = src_dataset.meta.features[feature_name]["dtype"]
@@ -900,11 +913,41 @@ def _copy_and_reindex_episodes_metadata(
         }
         episode_dict.update(episode_meta)
         episode_dict.update(flatten_dict({"stats": episode_stats}))
-        dst_meta._save_episode_metadata(episode_dict)
-
+        
+        # Add chunk/file indices for episodes metadata
+        episode_dict["meta/episodes/chunk_index"] = 0
+        episode_dict["meta/episodes/file_index"] = 0
+        
+        all_episode_dicts.append(episode_dict)
         total_frames += src_episode["length"]
 
-    dst_meta._close_writer()
+    # Write all episodes at once using pandas DataFrame to avoid schema mismatch issues
+    # This bypasses _save_episode_metadata which uses a buffered ParquetWriter that
+    # can fail when episode stats have inconsistent field orderings
+    if all_episode_dicts:
+        # Collect all unique keys from all episodes to ensure consistent schema
+        all_keys = set()
+        for ep_dict in all_episode_dicts:
+            all_keys.update(ep_dict.keys())
+        
+        # Build combined dict with all keys, using None for missing values
+        combined_dict = {key: [] for key in sorted(all_keys)}
+        for ep_dict in all_episode_dicts:
+            for key in combined_dict:
+                val = ep_dict.get(key)
+                # Convert numpy arrays to lists for PyArrow compatibility
+                if isinstance(val, np.ndarray):
+                    val = val.tolist()
+                combined_dict[key].append(val)
+        
+        # Write to parquet file
+        episodes_path = dst_meta.root / DEFAULT_EPISODES_PATH.format(chunk_index=0, file_index=0)
+        episodes_path.parent.mkdir(parents=True, exist_ok=True)
+        
+        df = pd.DataFrame(combined_dict)
+        df.to_parquet(episodes_path, index=False)
+        
+        logging.info(f"Wrote {len(all_episode_dicts)} episodes to {episodes_path}")
 
     dst_meta.info.update(
         {
