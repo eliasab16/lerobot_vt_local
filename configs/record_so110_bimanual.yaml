@@ -1,0 +1,74 @@
+# Bimanual SO110 recording config
+# Usage:
+#   lerobot-record --config_path=./configs/record_so110_bimanual.yaml \
+#       --dataset.repo_id=<hf_user>/<dataset_name> \
+#       --dataset.single_task="Describe the task here"
+#
+# Mirrors teleop_so110_bimanual.yaml and adds a dataset: section.
+# Hardware/port values must match the teleop config.
+
+robot:
+  type: bi_so110_follower
+  id: follower
+  left_arm_config:
+    port: /dev/tty.usbmodem5AE60845471
+    max_relative_target: 15
+    cameras:
+      top:
+        type: opencv
+        index_or_path: 0
+        width: 800
+        height: 600
+        fps: 30
+  right_arm_config:
+    port: /dev/tty.usbmodem5AE60803361
+    max_relative_target: 15
+    cameras:
+      top:
+        type: opencv
+        index_or_path: 1
+        width: 800
+        height: 600
+        fps: 30
+      bottom:
+        type: opencv
+        index_or_path: 3
+        width: 800
+        height: 600
+        fps: 30
+
+teleop:
+  type: bi_so110_leader
+  id: leader
+  left_arm_config:
+    port: /dev/tty.usbmodem5AAF2882501
+  right_arm_config:
+    port: /dev/tty.usbmodem5A680122821
+
+dataset:
+  # repo_id and single_task are REQUIRED — override via CLI.
+  repo_id: elisdev/so110_bimanual_placeholder
+  single_task: "Placeholder task — override with --dataset.single_task=..."
+  fps: 30
+  num_episodes: 20
+  episode_time_s: 30
+  reset_time_s: 10
+
+  # --- New-style encoding (fast episode saves) ---
+  # Streaming encoding pipes frames straight to the video encoder during capture
+  # instead of dumping PNGs first. save_episode() becomes near-instant.
+  streaming_encoding: true
+  # Auto-picks the best available hw encoder; on macOS this resolves to
+  # h264_videotoolbox. Set to libsvtav1 for best quality/size at higher CPU cost.
+  vcodec: auto
+  encoder_threads: 2
+  encoder_queue_maxsize: 30
+  video_encoding_batch_size: 1
+
+  # Local-only by default; flip to true + set tags/private if you want to push.
+  push_to_hub: false
+  private: false
+
+display_data: true
+play_sounds: true
+resume: false
