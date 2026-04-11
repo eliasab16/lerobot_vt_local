@@ -1,0 +1,33 @@
+# Single arm SO110 teleoperation config (left arm only)
+# Usage: lerobot-teleoperate --config_path=./configs/teleop_so110_left.yaml
+
+robot:
+  type: so110_follower
+  port: /dev/tty.usbmodem5AE60845471
+  id: left_follower
+  cameras:
+    wrist_top:
+      type: opencv
+      index_or_path: 0
+      width: 800
+      height: 600
+      fps: 30
+    wrist_bottom:
+      type: opencv
+      index_or_path: 1
+      width: 800
+      height: 600
+      fps: 30
+    overhead:
+      type: opencv
+      index_or_path: 2
+      width: 800
+      height: 600
+      fps: 30
+
+teleop:
+  type: so110_leader
+  port: /dev/tty.usbmodem5AAF2882501
+  id: left_leader
+
+display_data: true
