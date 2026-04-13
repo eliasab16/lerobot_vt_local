@@ -83,6 +83,14 @@ def make_teleoperator_from_config(config: TeleoperatorConfig) -> "Teleoperator":
         from .bi_so_leader import BiSOLeader
 
         return BiSOLeader(config)
+    elif config.type == "so110_leader":
+        from .so110_leader import SO110Leader
+
+        return SO110Leader(config)
+    elif config.type == "bi_so110_leader":
+        from .bi_so110_leader import BiSO110Leader
+
+        return BiSO110Leader(config)
     elif config.type == "reachy2_teleoperator":
         from .reachy2_teleoperator import Reachy2Teleoperator
 
