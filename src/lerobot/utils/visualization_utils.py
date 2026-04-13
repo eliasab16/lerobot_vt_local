@@ -93,7 +93,7 @@ def log_rerun_data(
                     img_entity = rr.Image(arr).compress() if compress_images else rr.Image(arr)
                     rr.log(key, entity=img_entity, static=True)
 
-    if action:
+    if action is not None and isinstance(action, dict):
         for k, v in action.items():
             if v is None:
                 continue

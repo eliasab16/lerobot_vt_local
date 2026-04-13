@@ -108,6 +108,7 @@ from lerobot.robots import (  # noqa: F401
     RobotConfig,
     bi_openarm_follower,
     bi_so_follower,
+    bi_so110_follower,
     earthrover_mini_plus,
     hope_jr,
     koch_follower,
@@ -116,6 +117,7 @@ from lerobot.robots import (  # noqa: F401
     openarm_follower,
     reachy2,
     so_follower,
+    so110_follower,
     unitree_g1 as unitree_g1_robot,
 )
 from lerobot.teleoperators import (  # noqa: F401
@@ -123,6 +125,7 @@ from lerobot.teleoperators import (  # noqa: F401
     TeleoperatorConfig,
     bi_openarm_leader,
     bi_so_leader,
+    bi_so110_leader,
     homunculus,
     koch_leader,
     make_teleoperator_from_config,
@@ -131,6 +134,7 @@ from lerobot.teleoperators import (  # noqa: F401
     openarm_mini,
     reachy2_teleoperator,
     so_leader,
+    so110_leader,
     unitree_g1,
 )
 from lerobot.teleoperators.keyboard.teleop_keyboard import KeyboardTeleop
@@ -353,13 +357,62 @@ def record_loop(
 
     no_action_count = 0
     timestamp = 0
+    # Takeover state: "policy" (autonomous), "paused" (waiting for grip), "manual" (teleop with offset)
+    _takeover_mode = "policy"
+    _follower_pos_at_pause: dict[str, float] = {}
+    _last_robot_action: dict[str, float] = {}  # last Goal_Position sent to follower
     start_episode_t = time.perf_counter()
     while timestamp < control_time_s:
         start_loop_t = time.perf_counter()
 
         if events["exit_early"]:
             events["exit_early"] = False
+            # Clear offset on episode end
+            if teleop is not None and isinstance(teleop, Teleoperator) and hasattr(teleop, 'clear_offset'):
+                teleop.clear_offset()
             break
+
+        # Handle takeover state transitions
+        if events["pause_policy"] and _takeover_mode == "policy" and teleop is not None and isinstance(teleop, Teleoperator):
+            events["pause_policy"] = False
+            _takeover_mode = "paused"
+            # Use last commanded Goal_Position (not Present_Position which may lag behind)
+            if _last_robot_action:
+                _follower_pos_at_pause = _last_robot_action
+            else:
+                obs_for_pause = robot.get_observation()
+                _follower_pos_at_pause = {k: v for k, v in obs_for_pause.items() if k.endswith(".pos")}
+            # Immediately re-send position to follower so it holds firm
+            robot.send_action(_follower_pos_at_pause)
+            if hasattr(teleop, 'unfreeze'):
+                try:
+                    teleop.unfreeze()
+                except RuntimeError:
+                    pass
+            logging.info("Policy paused. Grab the leader arm, then press T to take over.")
+        elif events["pause_policy"]:
+            events["pause_policy"] = False
+
+        if events["start_takeover"] and _takeover_mode == "paused" and teleop is not None and isinstance(teleop, Teleoperator):
+            events["start_takeover"] = False
+            _takeover_mode = "manual"
+            _takeover_first_frame = True
+            # Compute offset so follower doesn't jump
+            if hasattr(teleop, 'set_takeover_offset'):
+                teleop.set_takeover_offset(_follower_pos_at_pause)
+            # Immediately send the paused position to follower to prevent any gap
+            robot.send_action(_follower_pos_at_pause)
+            logging.info("Takeover active — teleop with offset alignment. Press → to end episode.")
+        elif events["start_takeover"]:
+            events["start_takeover"] = False
+
+        # In paused mode: keep sending last position to follower, don't record, wait for T key
+        if _takeover_mode == "paused":
+            if _follower_pos_at_pause:
+                robot.send_action(_follower_pos_at_pause)
+            precise_sleep(1 / fps)
+            timestamp = time.perf_counter() - start_episode_t
+            continue
 
         # Get robot observation
         obs = robot.get_observation()
@@ -375,8 +428,15 @@ def record_loop(
         # keeping the dataset at the original fps while the robot moves at the higher rate.
         is_record_frame = True
 
+        # In manual takeover mode, use teleop instead of policy
+        if _takeover_mode == "manual" and isinstance(teleop, Teleoperator):
+            act = teleop.get_action()
+            act_processed_teleop = teleop_action_processor((act, obs))
+            action_values = act_processed_teleop
+            robot_action_to_send = robot_action_processor((act_processed_teleop, obs))
+
         # Get action from either policy or teleop
-        if policy is not None and preprocessor is not None and postprocessor is not None:
+        elif policy is not None and preprocessor is not None and postprocessor is not None:
             # With interpolation: only call policy when interpolator needs new action
             if use_interpolation:
                 ran_inference = False
@@ -456,10 +516,15 @@ def record_loop(
         # so action actually sent is saved in the dataset. action = postprocessor.process(action)
         # TODO(steven, pepijn, adil): we should use a pipeline step to clip the action, so the sent action is the action that we input to the robot.
         _sent_action = robot.send_action(robot_action_to_send)
+        _last_robot_action = robot_action_to_send
+
+        # Mirror follower positions to leader arm during policy inference
+        if policy is not None and teleop is not None and isinstance(teleop, Teleoperator):
+            teleop.send_feedback(robot_action_to_send)
 
         # Write to dataset (only on real policy frames, not interpolated-only iterations)
         if dataset is not None and is_record_frame:
-            action_frame = build_dataset_frame(dataset.features, action_values, prefix=ACTION)
+            action_frame = build_dataset_frame(dataset.features, robot_action_to_send, prefix=ACTION)
             frame = {**observation_frame, **action_frame, "task": single_task}
             dataset.add_frame(frame)
 
@@ -553,7 +618,7 @@ def record(cfg: RecordConfig) -> LeRobotDataset:
             )
 
         # Load pretrained policy
-        policy = None if cfg.policy is None else make_policy(cfg.policy, ds_meta=dataset.meta)
+        policy = None if cfg.policy is None else make_policy(cfg.policy, ds_meta=dataset.meta, rename_map=cfg.dataset.rename_map)
         preprocessor = None
         postprocessor = None
         interpolator = None
@@ -587,6 +652,12 @@ def record(cfg: RecordConfig) -> LeRobotDataset:
             recorded_episodes = 0
             while recorded_episodes < cfg.dataset.num_episodes and not events["stop_recording"]:
                 log_say(f"Recording episode {dataset.num_episodes}", cfg.play_sounds)
+
+                # Enable leader tracing during policy episodes
+                _tracing = policy is not None and teleop is not None and isinstance(teleop, Teleoperator) and hasattr(teleop, 'freeze')
+                if _tracing:
+                    teleop.freeze()
+
                 record_loop(
                     robot=robot,
                     events=events,
@@ -605,6 +676,26 @@ def record(cfg: RecordConfig) -> LeRobotDataset:
                     interpolator=interpolator,
                     display_compressed_images=display_compressed_images,
                 )
+
+                # Clear takeover offset and disable tracing for reset
+                if teleop is not None and isinstance(teleop, Teleoperator) and hasattr(teleop, 'clear_offset'):
+                    teleop.clear_offset()
+                if _tracing:
+                    try:
+                        teleop.unfreeze()
+                    except RuntimeError:
+                        logging.warning("Failed to unfreeze leader (motor overload). Retrying...")
+                        import time
+                        time.sleep(0.5)
+                        try:
+                            teleop.unfreeze()
+                        except RuntimeError:
+                            logging.warning("Leader unfreeze failed again. Disabling torque manually.")
+                            try:
+                                teleop.bus.disable_torque()
+                                teleop._frozen = False
+                            except Exception:
+                                logging.error("Could not disable leader torque. Move the arm to relieve load and try again.")
 
                 # Execute a few seconds without recording to give time to manually reset the environment
                 # Skip reset for the last episode to be recorded
@@ -635,6 +726,28 @@ def record(cfg: RecordConfig) -> LeRobotDataset:
 
                 dataset.save_episode()
                 recorded_episodes += 1
+
+            # After the final episode, run an active teleop phase so the user can
+            # park the arm safely under leader control instead of having the loop
+            # end with the follower frozen at its last recorded pose.
+            # Press '6' (or right arrow) to exit early once the arm is in position.
+            if not events["stop_recording"]:
+                log_say(
+                    "Finished recording. Park the arm, then press 6 to exit.",
+                    cfg.play_sounds,
+                )
+                record_loop(
+                    robot=robot,
+                    events=events,
+                    fps=cfg.dataset.fps,
+                    teleop_action_processor=teleop_action_processor,
+                    robot_action_processor=robot_action_processor,
+                    robot_observation_processor=robot_observation_processor,
+                    teleop=teleop,
+                    control_time_s=cfg.dataset.reset_time_s,
+                    single_task=cfg.dataset.single_task,
+                    display_data=cfg.display_data,
+                )
     finally:
         log_say("Stop recording", cfg.play_sounds, blocking=True)
 
