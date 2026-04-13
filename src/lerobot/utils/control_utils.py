@@ -136,6 +136,8 @@ def init_keyboard_listener():
     events["exit_early"] = False
     events["rerecord_episode"] = False
     events["stop_recording"] = False
+    events["pause_policy"] = False      # SPACE: pause policy, release leader
+    events["start_takeover"] = False    # T: lock offset and start teleop
 
     if is_headless():
         logging.warning(
@@ -147,15 +149,27 @@ def init_keyboard_listener():
     # Only import pynput if not in a headless environment
     from pynput import keyboard
 
+    # Numpad aliases for the arrow-key bindings.
+    # '6' == right arrow (exit early), '4' == left arrow (rerecord episode).
+    # pynput on macOS does not distinguish numpad 4/6 from top-row 4/6, so both work.
+    key_6 = keyboard.KeyCode.from_char("6")
+    key_4 = keyboard.KeyCode.from_char("4")
+
     def on_press(key):
         try:
-            if key == keyboard.Key.right:
-                print("Right arrow key pressed. Exiting loop...")
+            if key == keyboard.Key.right or key == key_6:
+                print("Right/6 pressed. Exiting loop...")
                 events["exit_early"] = True
-            elif key == keyboard.Key.left:
-                print("Left arrow key pressed. Exiting loop and rerecord the last episode...")
+            elif key == keyboard.Key.left or key == key_4:
+                print("Left/4 pressed. Exiting loop and rerecord the last episode...")
                 events["rerecord_episode"] = True
                 events["exit_early"] = True
+            elif key == keyboard.Key.space:
+                print("SPACE pressed. Pausing policy — grab the leader arm, then press T to take over...")
+                events["pause_policy"] = True
+            elif hasattr(key, "char") and key.char == "t":
+                print("T pressed. Starting takeover with offset alignment...")
+                events["start_takeover"] = True
             elif key == keyboard.Key.esc:
                 print("Escape key pressed. Stopping data recording...")
                 events["stop_recording"] = True
