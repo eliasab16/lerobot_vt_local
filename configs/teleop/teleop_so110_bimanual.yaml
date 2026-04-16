@@ -1,0 +1,42 @@
+# Bimanual SO110 teleoperation config
+# Usage: lerobot-teleoperate --config_path=./configs/teleop_so110_bimanual.yaml
+
+robot:
+  type: bi_so110_follower
+  id: follower
+  left_arm_config:
+    port: /dev/tty.usbmodem5AE60845471
+    max_relative_target: 15
+    cameras:
+      top:
+        type: opencv
+        index_or_path: 0
+        width: 800
+        height: 600
+        fps: 30
+  right_arm_config:
+    port: /dev/tty.usbmodem5AE60803361
+    max_relative_target: 15
+    cameras:
+      top:
+        type: opencv
+        index_or_path: 1
+        width: 800
+        height: 600
+        fps: 30
+      bottom:
+        type: opencv
+        index_or_path: 3
+        width: 800
+        height: 600
+        fps: 30
+
+teleop:
+  type: bi_so110_leader
+  id: leader
+  left_arm_config:
+    port: /dev/tty.usbmodem5AAF2882501
+  right_arm_config:
+    port: /dev/tty.usbmodem5A680122821
+
+display_data: true
