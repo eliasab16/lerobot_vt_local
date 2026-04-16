@@ -1,0 +1,58 @@
+# XVLA eval/inference config — SO110 left arm
+#
+# Usage (policy server must already be running):
+#   lerobot-record --config_path=./configs/eval_xvla_left.yaml \
+#       --policy.path=<local_or_hf_path_to_xvla_policy>
+#
+# The teleop section is optional — if present, teleop stays live between
+# episodes (reset phase) so you can reposition the arm manually.
+# The rename_map remaps local camera names to XVLA's expected keys
+# (observation.images.image, image2, image3).
+
+robot:
+  type: so110_follower
+  port: /dev/tty.usbmodem5AE60845471
+  id: left_follower
+  cameras:
+    wrist_top:
+      type: opencv
+      index_or_path: 0
+      width: 640
+      height: 480
+      fps: 30
+    wrist_bottom:
+      type: opencv
+      index_or_path: 1
+      width: 640
+      height: 480
+      fps: 30
+    overhead:
+      type: opencv
+      index_or_path: 2
+      width: 640
+      height: 480
+      fps: 30
+
+teleop:
+  type: so110_leader
+  port: /dev/tty.usbmodem5AAF2882501
+  id: left_leader
+
+dataset:
+  repo_id: eliasab16/eval_xvla_test
+  single_task: "insert wire tip into mounted component's hole"
+  fps: 30
+  num_episodes: 3
+  episode_time_s: 100
+  reset_time_s: 100
+  push_to_hub: false
+  private: true
+  rename_map:
+    observation.images.wrist_top: observation.images.image
+    observation.images.wrist_bottom: observation.images.image2
+    observation.images.overhead: observation.images.image3
+
+display_data: true
+display_compressed_images: true
+play_sounds: true
+resume: false

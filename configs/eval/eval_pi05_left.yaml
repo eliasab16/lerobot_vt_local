@@ -1,0 +1,56 @@
+# Single-arm SO110 eval/inference config for pi0.5 (left arm, synchronous)
+#
+# Usage:
+#   lerobot-record --config_path=./configs/eval/eval_pi05_left.yaml \
+#       --policy.path=eliasab16/pi05_wire_tip_p1_4k
+#
+# The teleop section is optional — if present, teleop stays live between
+# episodes (reset phase) so you can reposition the arm manually.
+
+robot:
+  type: so110_follower
+  port: /dev/tty.usbmodem5AE60845471
+  id: left_follower
+  cameras:
+    wrist_top:
+      type: opencv
+      index_or_path: 0
+      width: 640
+      height: 480
+      fps: 30
+    wrist_bottom:
+      type: opencv
+      index_or_path: 1
+      width: 640
+      height: 480
+      fps: 30
+    overhead:
+      type: opencv
+      index_or_path: 2
+      width: 640
+      height: 480
+      fps: 30
+
+teleop:
+  type: so110_leader
+  port: /dev/tty.usbmodem5AAF2882501
+  id: left_leader
+
+dataset:
+  repo_id: eliasab16/eval_pi05
+  root: /Users/elisd/.cache/huggingface/lerobot/eliasab16/dagger_pi05_5k_part1
+  single_task: "insert wire tip into mounted component's hole"
+  fps: 30
+  num_episodes: 20
+  episode_time_s: 200
+  reset_time_s: 100
+  push_to_hub: false
+  private: true
+  streaming_encoding: true
+  vcodec: auto
+  encoder_threads: 2
+
+display_data: true
+display_compressed_images: false
+play_sounds: true
+resume: false

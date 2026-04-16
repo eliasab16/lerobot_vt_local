@@ -1,0 +1,61 @@
+# Single-arm SO110 eval/inference config (left arm only)
+#
+# Usage (policy server must already be running):
+#   lerobot-record --config_path=./configs/eval/eval_smolvla_left.yaml \
+#       --policy.path=<local_or_hf_path_to_policy>
+#
+# The teleop section is optional — if present, teleop stays live between
+# episodes (reset phase) so you can reposition the arm manually.
+# The rename_map remaps local camera names to the policy's expected keys.
+
+robot:
+  type: so110_follower
+  port: /dev/tty.usbmodem5AE60845471
+  id: left_follower
+  cameras:
+    wrist_top:
+      type: opencv
+      index_or_path: 0
+      width: 640
+      height: 480
+      fps: 30
+    wrist_bottom:
+      type: opencv
+      index_or_path: 1
+      width: 640
+      height: 480
+      fps: 30
+    overhead:
+      type: opencv
+      index_or_path: 2
+      width: 640
+      height: 480
+      fps: 30
+
+teleop:
+  type: so110_leader
+  port: /dev/tty.usbmodem5AAF2882501
+  id: left_leader
+
+dataset:
+  repo_id: eliasab16/eval_test
+  root: /Users/elisd/.cache/huggingface/lerobot/eliasab16/eval_test
+  single_task: "insert wire tip into mounted component's hole"
+  fps: 30
+  num_episodes: 20
+  episode_time_s: 100
+  reset_time_s: 100
+  push_to_hub: false
+  private: true
+  streaming_encoding: true
+  vcodec: auto
+  encoder_threads: 2
+  rename_map:
+    observation.images.wrist_top: observation.images.camera1
+    observation.images.wrist_bottom: observation.images.camera2
+    observation.images.overhead: observation.images.camera3
+
+display_data: true
+display_compressed_images: true
+play_sounds: true
+resume: false
