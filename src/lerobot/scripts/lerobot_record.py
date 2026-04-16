@@ -617,6 +617,11 @@ def record(cfg: RecordConfig) -> LeRobotDataset:
                 encoder_threads=cfg.dataset.encoder_threads,
             )
 
+        # Connect robot/cameras first so hardware issues fail fast (before slow model load)
+        robot.connect()
+        if teleop is not None:
+            teleop.connect()
+
         # Load pretrained policy
         policy = None if cfg.policy is None else make_policy(cfg.policy, ds_meta=dataset.meta, rename_map=cfg.dataset.rename_map)
         preprocessor = None
@@ -636,10 +641,6 @@ def record(cfg: RecordConfig) -> LeRobotDataset:
             if cfg.interpolation_multiplier > 1:
                 interpolator = ActionInterpolator(multiplier=cfg.interpolation_multiplier)
                 logging.info(f"Action interpolation enabled: {cfg.interpolation_multiplier}x control rate")
-
-        robot.connect()
-        if teleop is not None:
-            teleop.connect()
 
         listener, events = init_keyboard_listener()
 
