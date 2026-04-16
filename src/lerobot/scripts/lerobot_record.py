@@ -359,6 +359,16 @@ def record_loop(
     timestamp = 0
     # Takeover state: "policy" (autonomous), "paused" (waiting for grip), "manual" (teleop with offset)
     _takeover_mode = "policy"
+    if policy is not None and teleop is not None and not getattr(record_loop, '_controls_printed', False):
+        print("\n--- Controls (keyboard / numpad) ---")
+        print("  SPACE / 5  — Pause policy, release leader")
+        print("  T / 3      — Takeover (completion: keep all frames)")
+        print("  R / 1      — Takeover (recovery: discard policy frames)")
+        print("  Right / 6  — End and save episode")
+        print("  Left / 4   — Discard episode, re-record")
+        print("  ESC / 7    — Stop recording")
+        print("------------------------------------\n")
+        record_loop._controls_printed = True
     _follower_pos_at_pause: dict[str, float] = {}
     _last_robot_action: dict[str, float] = {}  # last Goal_Position sent to follower
     start_episode_t = time.perf_counter()
@@ -388,7 +398,12 @@ def record_loop(
                 try:
                     teleop.unfreeze()
                 except RuntimeError:
-                    pass
+                    logging.warning("Failed to unfreeze leader during pause. Forcing torque off.")
+                    try:
+                        teleop.bus.disable_torque()
+                        teleop._frozen = False
+                    except Exception:
+                        logging.error("Could not disable leader torque. Move arm to relieve load.")
             logging.info("Policy paused. Grab the leader arm, then press T to take over.")
         elif events["pause_policy"]:
             events["pause_policy"] = False
@@ -396,15 +411,30 @@ def record_loop(
         if events["start_takeover"] and _takeover_mode == "paused" and teleop is not None and isinstance(teleop, Teleoperator):
             events["start_takeover"] = False
             _takeover_mode = "manual"
-            _takeover_first_frame = True
             # Compute offset so follower doesn't jump
             if hasattr(teleop, 'set_takeover_offset'):
                 teleop.set_takeover_offset(_follower_pos_at_pause)
             # Immediately send the paused position to follower to prevent any gap
             robot.send_action(_follower_pos_at_pause)
-            logging.info("Takeover active — teleop with offset alignment. Press → to end episode.")
+            logging.info("Takeover (completion) — keeping all frames. Press → to end episode.")
         elif events["start_takeover"]:
             events["start_takeover"] = False
+
+        if events["start_recovery"] and _takeover_mode == "paused" and teleop is not None and isinstance(teleop, Teleoperator):
+            events["start_recovery"] = False
+            _takeover_mode = "manual"
+            # Compute offset so follower doesn't jump
+            if hasattr(teleop, 'set_takeover_offset'):
+                teleop.set_takeover_offset(_follower_pos_at_pause)
+            # Wipe all policy frames recorded so far in this episode
+            if dataset is not None:
+                dataset.clear_episode_buffer()
+                logging.info("Recovery mode — policy frames discarded. Recording from here.")
+            # Immediately send the paused position to follower to prevent any gap
+            robot.send_action(_follower_pos_at_pause)
+            logging.info("Takeover (recovery) — recording only manual frames. Press → to end episode.")
+        elif events["start_recovery"]:
+            events["start_recovery"] = False
 
         # In paused mode: keep sending last position to follower, don't record, wait for T key
         if _takeover_mode == "paused":
@@ -518,8 +548,8 @@ def record_loop(
         _sent_action = robot.send_action(robot_action_to_send)
         _last_robot_action = robot_action_to_send
 
-        # Mirror follower positions to leader arm during policy inference
-        if policy is not None and teleop is not None and isinstance(teleop, Teleoperator):
+        # Mirror follower positions to leader arm during policy inference only
+        if _takeover_mode == "policy" and teleop is not None and isinstance(teleop, Teleoperator):
             teleop.send_feedback(robot_action_to_send)
 
         # Write to dataset (only on real policy frames, not interpolated-only iterations)
@@ -716,6 +746,7 @@ def record(cfg: RecordConfig) -> LeRobotDataset:
                         control_time_s=cfg.dataset.reset_time_s,
                         single_task=cfg.dataset.single_task,
                         display_data=cfg.display_data,
+                        display_compressed_images=display_compressed_images,
                     )
 
                 if events["rerecord_episode"]:
@@ -748,6 +779,7 @@ def record(cfg: RecordConfig) -> LeRobotDataset:
                     control_time_s=cfg.dataset.reset_time_s,
                     single_task=cfg.dataset.single_task,
                     display_data=cfg.display_data,
+                    display_compressed_images=display_compressed_images,
                 )
     finally:
         log_say("Stop recording", cfg.play_sounds, blocking=True)
