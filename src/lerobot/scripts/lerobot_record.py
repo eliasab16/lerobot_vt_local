@@ -118,6 +118,7 @@ from lerobot.robots import (  # noqa: F401
     reachy2,
     so_follower,
     so110_follower,
+    so110_follower_heavy,
     unitree_g1 as unitree_g1_robot,
 )
 from lerobot.teleoperators import (  # noqa: F401
@@ -154,6 +155,8 @@ from lerobot.utils.utils import (
     log_say,
 )
 from lerobot.utils.visualization_utils import init_rerun, log_rerun_data
+from remote_inference.client import RemoteInferenceClient
+from lerobot.policies.rtc.configuration_rtc import RTCConfig
 
 
 @dataclass
@@ -236,6 +239,10 @@ class RecordConfig:
     # Action interpolation multiplier for smoother policy control (1=off, 2=2x, 3=3x)
     # Only applies when using a policy (not teleop)
     interpolation_multiplier: int = 1
+    # Remote inference (WebSocket-based async inference)
+    remote_inference_url: str | None = None
+    remote_inference_rtc: bool = False
+    remote_inference_execution_horizon: int = 20
 
     def __post_init__(self):
         # HACK: We parse again the cli args here to get the pretrained path if there was one.
@@ -310,6 +317,7 @@ def record_loop(
     display_data: bool = False,
     interpolator: ActionInterpolator | None = None,
     display_compressed_images: bool = False,
+    remote_client=None,  # RemoteInferenceClient | None
 ):
     if dataset is not None and dataset.fps != fps:
         raise ValueError(f"The dataset fps should be equal to requested fps ({dataset.fps} != {fps}).")
@@ -348,6 +356,10 @@ def record_loop(
     # Reset interpolator if provided
     if interpolator is not None:
         interpolator.reset()
+
+    # Clear remote inference action queue — drops any stale actions from previous episodes
+    if remote_client is not None:
+        remote_client.clear_queue()
 
     # Calculate control interval based on interpolation
     use_interpolation = interpolator is not None and interpolator.enabled and policy is not None
@@ -450,7 +462,7 @@ def record_loop(
         # Applies a pipeline to the raw robot observation, default is IdentityProcessor
         obs_processed = robot_observation_processor(obs)
 
-        if policy is not None or dataset is not None:
+        if policy is not None or dataset is not None or remote_client is not None:
             observation_frame = build_dataset_frame(dataset.features, obs_processed, prefix=OBS_STR)
 
         # Track whether this iteration should be recorded to the dataset.
@@ -464,6 +476,36 @@ def record_loop(
             act_processed_teleop = teleop_action_processor((act, obs))
             action_values = act_processed_teleop
             robot_action_to_send = robot_action_processor((act_processed_teleop, obs))
+
+        # Remote async inference takes precedence over sync policy when both are configured.
+        # (sync policy is still loaded for `cfg.policy.pretrained_path`, but doesn't run locally.)
+        # Observations are streamed to a remote GPU server; actions arrive asynchronously via a queue.
+        elif remote_client is not None:
+            remote_client.update_observation(
+                state=observation_frame["observation.state"],
+                images={
+                    k.removeprefix("observation.images."): v
+                    for k, v in observation_frame.items()
+                    if k.startswith("observation.images.")
+                },
+                task=single_task,
+            )
+
+            # Pop next action from queue (may be None during warmup or latency spikes)
+            action_tensor = remote_client.get_action()
+            if action_tensor is None:
+                if _last_robot_action:
+                    # Hold-last-position fallback — reuse previous action
+                    action_values = _last_robot_action
+                    robot_action_to_send = _last_robot_action
+                else:
+                    # No action ever received (still warming up) — skip this frame
+                    continue
+            else:
+                action_names = sorted(robot.action_features)
+                action_values = {name: float(action_tensor[i]) for i, name in enumerate(action_names)}
+                act_processed_policy = make_robot_action(action_values, dataset.features)
+                robot_action_to_send = robot_action_processor((act_processed_policy, obs))
 
         # Get action from either policy or teleop
         elif policy is not None and preprocessor is not None and postprocessor is not None:
@@ -589,6 +631,33 @@ def record(cfg: RecordConfig) -> LeRobotDataset:
     )
 
     robot = make_robot_from_config(cfg.robot)
+
+    # check if remote inference is enabled, and set it up accordingly
+    remote_client = None
+    if cfg.remote_inference_url is not None:
+        rtc_config = None
+        if cfg.remote_inference_rtc:
+            rtc_config = RTCConfig(
+                enabled=True,
+                execution_horizon=cfg.remote_inference_execution_horizon,
+            )
+
+        remote_client = RemoteInferenceClient(
+            server_url=cfg.remote_inference_url,
+            fps=cfg.dataset.fps,
+            rtc_config=rtc_config,
+        )
+
+        remote_client.setup(
+            policy_path=cfg.policy.pretrained_path,
+            action_dim=len(robot.action_features),
+            camera_names=list(robot.cameras.keys()),
+            task=cfg.dataset.single_task,
+            device="cuda",
+        )
+        remote_client.start()
+
+
     teleop = make_teleoperator_from_config(cfg.teleop) if cfg.teleop is not None else None
 
     teleop_action_processor, robot_action_processor, robot_observation_processor = make_default_processors()
@@ -706,6 +775,7 @@ def record(cfg: RecordConfig) -> LeRobotDataset:
                     display_data=cfg.display_data,
                     interpolator=interpolator,
                     display_compressed_images=display_compressed_images,
+                    remote_client=remote_client,
                 )
 
                 # Clear takeover offset and disable tracing for reset
@@ -783,6 +853,9 @@ def record(cfg: RecordConfig) -> LeRobotDataset:
                 )
     finally:
         log_say("Stop recording", cfg.play_sounds, blocking=True)
+
+        if remote_client is not None:
+            remote_client.stop()
 
         if dataset:
             dataset.finalize()
